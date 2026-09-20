@@ -1,0 +1,4 @@
+RAG 的核心是把外部知识接进模型
+Chunking 决定检索粒度，Embedding 决定语义相似度
+KPI 和 GMV 是业务指标，MVP 是产品阶段
+Prompt Engineering 需要反复迭代

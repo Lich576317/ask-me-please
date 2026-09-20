@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>框选区域</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    cursor: crosshair;
+    user-select: none;
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  }
+
+  /* 底图 = 截屏快照。
+     不用真透明窗口：WebView2 做不到「看穿到桌面」，
+     所以先截一张全屏图当背景，用户在图上框选 —— 效果等价，且不依赖任何窗口特效。 */
+  #shot {
+    position: absolute; inset: 0;
+    background-image: url("_shot.png");
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+    background-color: #2a3a4a;
+  }
+
+  #mask { position: absolute; inset: 0; background: rgba(18, 40, 66, .48); }
+
+  /* 选区：用一个巨大的外阴影把【选区之外】压暗，
+     这样选区内部保持原图亮度 —— 不需要真的挖洞。 */
+  #sel {
+    position: absolute;
+    display: none;
+    border: 2px solid #7fc0ff;
+    box-shadow: 0 0 0 100vmax rgba(18, 40, 66, .48);
+  }
+
+  #hint {
+    position: absolute;
+    top: 22px; left: 50%;
+    transform: translateX(-50%);
+    padding: 9px 20px;
+    background: rgba(255, 255, 255, .95);
+    border-radius: 999px;
+    font-size: 13px;
+    color: #000;
+    white-space: nowrap;
+  }
+
+  #size {
+    position: absolute;
+    display: none;
+    padding: 4px 10px;
+    background: #7fc0ff;
+    border-radius: 8px;
+    font-size: 12px;
+    color: #000;
+    white-space: nowrap;
+  }
+
+  #err {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    padding: 14px 20px;
+    background: #fff;
+    border-radius: 14px;
+    font-size: 13px;
+    color: #000;
+    display: none;
+  }
+</style>
+</head>
+<body>
+  <div id="shot"></div>
+  <div id="mask"></div>
+  <div id="sel"></div>
+  <div id="size"></div>
+  <div id="hint">拖动鼠标框选要识别的区域　·　按 Esc 取消</div>
+  <div id="err"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  const shot = document.getElementById('shot');
+  const mask = document.getElementById('mask');
+  const sel  = document.getElementById('sel');
+  const size = document.getElementById('size');
+  const hint = document.getElementById('hint');
+  const err  = document.getElementById('err');
+
+  let mon = [0, 0];          // 显示器物理尺寸，用于在框选时显示真实像素
+  let start = null;          // 起点（视口坐标）
+  let dragging = false;
+
+  /* ── 等桥就绪 ──────────────────────────────────────── */
+  function apiReady() {
+    const a = window.pywebview && window.pywebview.api;
+    return !!(a && typeof a.set_region === 'function');
+  }
+  function whenReady(fn) {
+    if (apiReady()) return fn();
+    let n = 0;
+    const t = setInterval(() => {
+      if (apiReady()) { clearInterval(t); fn(); }
+      else if (++n > 200) {
+        clearInterval(t);
+        err.style.display = 'block';
+        err.textContent = '⚠ 前后端没连上，框选无法回传';
+      }
+    }, 50);
+  }
+
+  /* ── 底图加载失败要说话，不能默默给一张空白 ─────────── */
+  const probe = new Image();
+  probe.onerror = () => {
+    err.style.display = 'block';
+    err.textContent = '⚠ 底图 _shot.png 没加载出来';
+  };
+  probe.src = '_shot.png';
+
+  whenReady(async () => {
+    const info = await window.pywebview.api.region_info();
+    mon = info.monitor;
+  });
+
+  /* ── 框选 ──────────────────────────────────────────── */
+  function rectOf(a, b) {
+    return {
+      x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
+      w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y),
+    };
+  }
+
+  function paint(r) {
+    sel.style.display = 'block';
+    sel.style.left = r.x + 'px';
+    sel.style.top = r.y + 'px';
+    sel.style.width = r.w + 'px';
+    sel.style.height = r.h + 'px';
+
+    // 显示折算后的真实像素尺寸
+    const pw = Math.round(r.w / window.innerWidth * mon[0]);
+    const ph = Math.round(r.h / window.innerHeight * mon[1]);
+    size.style.display = 'block';
+    size.textContent = pw + ' × ' + ph;
+    // 贴在选区上方，越界就翻到下面
+    size.style.left = r.x + 'px';
+    size.style.top = (r.y > 30 ? r.y - 28 : r.y + r.h + 6) + 'px';
+  }
+
+  document.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    dragging = true;
+    start = { x: e.clientX, y: e.clientY };
+    mask.style.display = 'none';        // 交给 #sel 的巨阴影去压暗
+    hint.style.display = 'none';
+    paint(rectOf(start, start));
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    paint(rectOf(start, { x: e.clientX, y: e.clientY }));
+  });
+
+  document.addEventListener('mouseup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+
+    const r = rectOf(start, { x: e.clientX, y: e.clientY });
+    if (r.w < 8 || r.h < 8) {           // 误点一下，当没发生
+      reset();
+      return;
+    }
+
+    /* ★ 关键：回传【归一化 0~1】坐标，不回传像素。
+
+       本机是 150% 缩放，JS 拿到的是 CSS 像素，屏幕是物理像素，
+       中间差 1.5 倍 —— 这正是这个项目栽过跟头的地方（附录 B）。
+       除以视口尺寸后，两边都只剩「占屏幕的比例」，
+       Python 那边乘以显示器物理尺寸即可，全程不经过任何 DPI 换算。 */
+    const W = window.innerWidth, H = window.innerHeight;
+
+    // 把原始数字报给后端打印。坐标对不上时，这行能一眼看出
+    // 差在「视口多大」还是「选区画在哪」—— 比在外面猜快得多。
+    try {
+      window.pywebview.api.report('框选',
+        'CSS ' + r.x + ',' + r.y + ' ' + r.w + 'x' + r.h +
+        '　视口 ' + W + 'x' + H + '　DPR ' + window.devicePixelRatio);
+    } catch (e) { /* 只是诊断，失败不影响框选 */ }
+
+    window.pywebview.api.set_region(
+      r.x / W, r.y / H, (r.x + r.w) / W, (r.y + r.h) / H
+    );
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') window.pywebview.api.cancel_region();
+  });
+
+  document.addEventListener('contextmenu', (e) => { e.preventDefault(); reset(); });
+
+  function reset() {
+    sel.style.display = 'none';
+    size.style.display = 'none';
+    mask.style.display = 'block';
+    hint.style.display = 'block';
+  }
+})();
+</script>
+</body>
+</html>

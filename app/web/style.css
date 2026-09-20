@@ -1,0 +1,837 @@
+/* ══════════════════════════════════════════════════════════
+   问了吗 · 样式
+   ══════════════════════════════════════════════════════════
+
+   设计规范（进展文档 第四节，写死）：
+     · 浅色 + 冷色系
+     · 字体统一黑色 —— 【层级只能用字重和字号区分，不能用灰度】
+     · 形状不尖锐 —— 统一圆角
+
+   ⚠ 因此本文件里【没有】任何灰色文字。
+     所有 --ink 之外的颜色只用于「底」和「边框」，不用于文字。
+   ══════════════════════════════════════════════════════════ */
+
+:root {
+  /* 底与线（冷色系） */
+  --bg:      #eef4fa;
+  --card:    #ffffff;
+  --line:    #dbe8f5;
+  --bar:     #e5f0fb;
+  --sunken:  #f4f9fd;
+
+  /* 文字：只有这一个颜色 */
+  --ink:     #000000;
+
+  /* 强调色（仅用于底色/描边/图标，不用于正文） */
+  --accent:      #2f6fb5;
+  --accent-soft: #d6e8fa;
+  --accent-line: #b9d6f2;
+
+  --ok:      #2c8a58;
+  --ok-soft: #d9f0e4;
+  --ok-line: #b3e0c8;
+
+  /* 圆角：统一不尖锐 */
+  --r-card: 14px;
+  --r-ctrl: 10px;
+  --r-pill: 999px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ⚠ 必须放在所有组件样式【之前】且加 !important。
+   浏览器默认的 [hidden]{display:none} 特异性极低，
+   会被下面 .popover{display:flex} 之类的规则盖掉 ——
+   结果就是 hidden 属性写了等于没写，弹层全都露在外面。 */
+[hidden] { display: none !important; }
+
+html, body { height: 100%; }
+
+body {
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+               system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  cursor: default;
+}
+
+/* ── 滚动条：窄、冷色、圆头 ───────────────────────────── */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--accent-line);
+  border-radius: var(--r-pill);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+/* ══════════ 标题栏 ══════════ */
+.titlebar {
+  flex: 0 0 auto;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 8px 0 14px;
+  background: var(--bar);
+  border-bottom: 1px solid var(--line);
+  user-select: none;
+  overflow: hidden;
+}
+
+/* ⚠ nowrap 是【硬要求】，不是顺手加的：
+   「问了吗」三个字被折成「问了」/「吗」两行时，标题栏高度会跟着跳，
+   而且面板顶部那一眼看上去就像坏了。宽度够排得开（见 shell.PANEL_W）是
+   第一道保险，这两条 nowrap + flex-shrink:0 是第二道 ——
+   宽度哪天又被调窄，宁可把按钮挤出去，也不要让标题换行。 */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.brand-name {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .5px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+/* 自动通道开关 */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 9px 0 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--sunken);
+  font: inherit;
+  font-size: 11px;
+  color: var(--ink);
+  cursor: pointer;
+}
+.switch-dot {
+  width: 8px; height: 8px;
+  border-radius: var(--r-pill);
+  background: var(--accent-line);
+  transition: background .15s;
+}
+.switch[data-on="true"] {
+  background: var(--ok-soft);
+  border-color: var(--ok-line);
+}
+.switch[data-on="true"] .switch-dot { background: var(--ok); }
+
+/* 开关上那行字是会变的（自动 · 42s → 自动 · 9s），
+   ⚠ 不定宽的话标题栏会跟着一秒一抖。
+   nowrap 同理：标签一换行，标题栏高度就跳。 */
+.switch-label {
+  min-width: 46px;
+  text-align: left;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;   /* 数字等宽，倒计时不会左右晃 */
+}
+
+/* 「开着、正在等」的中间态。
+   ⚠ 只有开着还不算数 —— 用户得能一眼看出它到底在不在等。
+     脉冲 = 正在盯着；脉冲停了（data-busy） = 已经在跑了。 */
+.switch[data-on="true"][data-busy="false"] .switch-dot {
+  animation: wl-pulse 1.6s ease-in-out infinite;
+}
+.switch[data-on="true"][data-busy="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+@keyframes wl-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .3; }
+}
+
+/* 系统设了「减少动态效果」就别脉冲 —— 用静止的深色点代替，
+   状态照样看得出来，只是不闪。 */
+@media (prefers-reduced-motion: reduce) {
+  .switch[data-on="true"][data-busy="false"] .switch-dot {
+    animation: none;
+    opacity: .55;
+  }
+}
+
+/* 窗口按钮 */
+.tb-actions { display: flex; gap: 4px; flex: 0 0 auto; align-items: center; }
+
+.ico {
+  width: 26px; height: 26px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  cursor: pointer;
+}
+.ico:hover { background: var(--accent-soft); border-color: var(--accent-line); }
+.ico-close:hover { background: #fadfdf; border-color: #efb9b9; }
+
+/* 齿轮（操作台）。带文字标签，不只是个 ⚙ —— 见 index.html 里的说明。
+   当前就在操作台时加 data-on，和自动开关一样的「选中」语言。 */
+.ico-wide {
+  width: auto;
+  gap: 4px;
+  padding: 0 9px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ico-glyph { font-size: 12px; }
+.ico-wide[data-on="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+/* ══════════ 停靠菜单 ══════════ */
+.popover {
+  position: absolute;
+  top: 46px; right: 8px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+}
+.popover button {
+  padding: 8px 16px 8px 12px;
+  border: 0;
+  border-radius: var(--r-ctrl);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.popover button:hover { background: var(--accent-soft); }
+
+/* ══════════ 主体滚动区 ══════════ */
+.scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 停靠上下时，改成横向卡片流 —— 对应竖版收成顶栏、内容铺开的思路 */
+body[data-dock="top"] .scroll,
+body[data-dock="bottom"] .scroll {
+  flex-direction: row;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+body[data-dock="top"] .scroll > *,
+body[data-dock="bottom"] .scroll > * {
+  flex: 0 0 auto;
+  width: 300px;
+}
+
+/* ══════════ 卡片 ══════════ */
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 13px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.card-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .4px;
+}
+
+/* 卡片右上角：pill + 一个小按钮。
+   ⚠ 要允许换行，理由和 .btn-row 一样 —— 卡片宽度是固定的，
+     两个东西并排再加上长一点的数字（「库中 128 条　已排除 12」）就顶出去了。 */
+.head-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.field-label {
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: -4px;
+}
+
+/* ══════════ 输入 ══════════ */
+.input,
+.textarea {
+  flex: 1 1 auto;
+  width: 100%;
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctrl);
+  background: var(--sunken);
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  outline: none;
+}
+.input:focus,
+.textarea:focus {
+  border-color: var(--accent);
+  background: var(--card);
+}
+
+.textarea {
+  min-height: 128px;
+  resize: vertical;
+  line-height: 1.7;
+  font-family: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
+  font-size: 12px;
+}
+
+.row { display: flex; gap: 7px; align-items: center; }
+.row-gap { margin-top: -2px; }
+
+/* ══════════ 按钮 ══════════ */
+.btn {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-ctrl);
+  background: var(--card);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--accent-soft); }
+.btn:active { background: var(--accent-line); }
+
+.btn-primary {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.btn-primary:hover { background: var(--accent-line); }
+
+.btn-ghost { font-weight: 400; }
+
+.btn-tiny {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.btn-block { width: 100%; }
+
+/* ⚠ 这一栏必须是【会换行的】。
+   原来的写法是 flex:1 1 0 + .btn 上的 white-space:nowrap ——
+   三个按钮强行均分卡片宽度，而 nowrap 又让文字缩不了，
+   于是「收纳历史」「导出 md」直接【画出卡片外面】去（v0.10 一直是那样）。
+   flex-wrap + flex-basis:auto 之后：排得下就均分，排不下就折到第二行，
+   怎么着都不会溢出。min-width 保证一行里不会挤成竖排的单个字。 */
+.btn-row { display: flex; gap: 7px; flex-wrap: wrap; }
+.btn-row .btn { flex: 1 1 auto; min-width: 84px; text-align: center; }
+
+/* ══════════ 知识库三策略 ══════════
+   ⚠ 是【竖排的三档】，不是横排的分段控件。
+     横排的话：面板 CSS 宽度只有 230 出头，减去卡片内边距只剩约 200，
+     三个按钮均分下来每个约 60px，而「不重复解释」五个字就要 55px ——
+     字会各自折成「不重复解」/「释」两行（v0.7 起就是这样，看起来像坏了）。
+     竖排之后每一档还多出一行放副标题，正好回答「我什么时候该切这个」。
+   这跟设计规范不冲突：层级仍然只用【字重和字号】区分，没有用到灰度。 */
+.seg {
+  display: flex;
+  flex-direction: column;
+  padding: 3px;
+  gap: 3px;
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctrl);
+}
+.seg-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+.seg-btn > b { font-weight: 400; }
+.seg-btn > span { font-size: 10px; font-weight: 400; }
+.seg-btn:hover { background: var(--accent-soft); }
+/* 选中的那一档：底色 + 描边 + 标签加粗。
+   三样一起上，是因为【不能用灰度】—— 只靠底色的话，
+   低对比度的屏幕上「选中的那个」不够一眼看出来。 */
+.seg-btn[data-active="true"] {
+  background: var(--card);
+  border: 1px solid var(--accent-line);
+}
+.seg-btn[data-active="true"] > b { font-weight: 700; }
+
+/* ══════════ 自动通道四档（v0.13）══════════
+   同一个 .seg 组件，只是横排。能横排是因为这里的标签只有「1 分钟」这种
+   三四个字；知识库那三档是 5 个字还带副标题，横排会折行，所以那边必须竖排。
+   代价：这里放不下副标题，说明挪到卡片那行 p.msg 里了。
+   flex-wrap + min-width 和 .btn-row 是同一套兜底 —— 真挤不下就折成两行，
+   绝不会画出卡片外面去（v0.10 被这个坑过）。 */
+.seg-row { flex-direction: row; flex-wrap: wrap; }
+.seg-row .seg-btn {
+  flex: 1 1 0;
+  min-width: 56px;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 4px;
+  /* ⚠ 未选中也要占住这 1px。基础样式是 border:0，选中态才加 1px 边框，
+     横排里那会让整排按钮当场跳一下（竖排时看不出来）。 */
+  border: 1px solid transparent;
+}
+.seg-row .seg-btn > b { font-size: 12px; }
+
+/* ══════════ 标签 ══════════ */
+.pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.pill-ok { background: var(--ok-soft); border-color: var(--ok-line); }
+
+/* ══════════ 模型厂商 ══════════ */
+.vendor {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 11px;
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-line);
+  border-radius: var(--r-ctrl);
+}
+.vendor-badge {
+  width: 26px; height: 26px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 8px;
+  background: var(--card);
+  border: 1px solid var(--ok-line);
+  font-size: 11px;
+  font-weight: 700;
+}
+.vendor-name { font-size: 12px; font-weight: 600; }
+.vendor .pill-ok { margin-left: auto; }
+
+/* ══════════ 辅助文字（仍是黑色，靠字号降级）══════════ */
+.msg {
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.6;
+}
+
+/* ══════════ 条目流 ══════════ */
+.stream {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stream-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 3px 0;
+}
+
+.entry {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-card);
+  padding: 11px 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.entry:hover { border-color: var(--accent-line); border-left-color: var(--accent); }
+
+.entry-term {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: .2px;
+  /* 标题可能是词组或一整句英文 —— 长单词（`LongShortTermMemory`）不给它断行
+     的话会把卡片撑破。截断在 app.js 的 TERM_TITLE_MAX 那一步做，
+     这里只是别让极端情况漏出去。 */
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 标题被截断时，完整的那句原文挪到这里。
+   ⚠ 只在真被截断时出现 —— 短术语（RAG）标题就是全的，再挂一行「原句」是重复。
+   不另设颜色：这套样式表里正文只有 --ink 一个色（见 :root 的说明），
+   靠字号小一档 + 左边那道竖线，已经足够和下面的解释正文分开。 */
+.entry-quote {
+  font-size: 11px;
+  line-height: 1.65;
+  border-left: 2px solid var(--line);
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+}
+
+.entry-body {
+  font-size: 12px;
+  line-height: 1.75;
+}
+
+/* 候选词卡片里那行「原文出处」。
+   ⚠ 它和 .entry-body（AI 给的解释）不是一个东西：
+     body 是结论，src 是证据。
+   ① 阶段只出得起证据，② 回来之后 body 才出现 —— 两张卡长得很像，
+   但 src 永远在，body 只在 AI 答上来时才有。 */
+.entry-src {
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+/* 管线耗时行 */
+.stat {
+  font-size: 11px;
+  text-align: center;
+  padding: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.stream-note {
+  font-size: 11px;
+  text-align: center;
+  padding: 6px 0 2px;
+  line-height: 1.7;
+}
+
+/* ══════════ 原始数据折叠块 ══════════ */
+.raw {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 9px 11px;
+  font-size: 11px;
+}
+
+.raw > summary {
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;          /* 去掉默认三角，自己画一个，免得它跑到圆角外面 */
+}
+.raw > summary::-webkit-details-marker { display: none; }
+.raw > summary::before { content: "▸ "; }
+.raw[open] > summary::before { content: "▾ "; }
+
+.raw pre {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;     /* OCR 出来的行可能很长，别撑破侧栏 */
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.raw .msg { margin-top: 8px; }
+
+/* ══════════ 禁用态 ══════════ */
+.btn:disabled {
+  cursor: default;
+  background: var(--sunken);
+  border-color: var(--line);
+}
+
+/* ══════════ 底部诊断条 ══════════ */
+.diag {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  background: var(--bar);
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  user-select: text;
+}
+
+/* ══════════ 首次使用告知 ══════════ */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(47, 111, 181, .18);
+}
+
+.dialog {
+  width: 100%;
+  max-width: 320px;
+  padding: 20px 18px;
+  background: var(--card);
+  border: 1px solid var(--accent-line);
+  border-radius: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dialog-title { font-size: 15px; font-weight: 700; }
+
+.dialog-text { font-size: 12px; line-height: 1.75; }
+
+.dialog-list {
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* ══════════ 操作台 ══════════ */
+.console-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 2px 2px;
+}
+.console-title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: .5px;
+}
+
+/* 屏蔽词列表。一行一个词 + 一个「移除」。
+   ⚠ 词是【从用户输入来的】，可能很长（一整句英文），
+     所以一定要 overflow-wrap，否则长词会把卡片撑破 ——
+     这正是知识库那三个按钮犯过的错。 */
+.blk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.blk-list:empty { display: none; }
+
+.blk-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 11px;
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctrl);
+}
+.blk-item > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.blk-empty {
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+/* ══════════ 关闭确认框（Windows 消息框的样子） ══════════
+   ⚠ 层级要高于首次使用告知那个 overlay（同为 50），
+     否则关窗时如果告知还没点掉，两个会叠在一起分不清谁在上面。 */
+#closebox { z-index: 60; }
+
+.msgbox {
+  width: 100%;
+  max-width: 330px;
+  background: var(--card);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-card);
+  overflow: hidden;
+}
+
+/* 顶上那条彩色标题带 —— Windows 消息框最认得出的特征，
+   也是「这是个系统级确认」而不是「页面里弹了个泡」的视觉信号。 */
+.msgbox-title {
+  padding: 9px 14px;
+  background: var(--bar);
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .3px;
+}
+
+.msgbox-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 14px 14px;
+}
+
+/* 那个「?」——Windows 里是圆形底 + 蓝字，这里照做（底色不是文字色，
+   不违反「文字只有黑色」那条规范；圈里的字仍然是 --ink）。 */
+.msgbox-icon {
+  flex: 0 0 auto;
+  width: 30px; height: 30px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.msgbox-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+
+.msgbox-btns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 14px 14px;
+}
+.msgbox-btns .btn { min-width: 72px; text-align: center; }
+
+/* ══════════ 条目卡片的头（术语 + 来源标记） ══════════ */
+.entry-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* 来源标记两边都标。
+   只标「来自知识库」那一侧的话，等库养熟了、大部分卡片都带标记，
+   那张没标记的反而显得像没渲染完 —— 用户会以为程序卡住了。
+
+   ⚠ 按设计规范，层级只能用字重和字号区分、【不能用灰度】，
+     所以标记靠底色 + 描边，不靠灰字。 */
+.pill-kb {
+  background: var(--ok-soft);
+  border-color: var(--ok-line);
+  flex: none;
+}
+.pill-plain {
+  background: var(--card);
+  border-color: var(--line);
+  flex: none;
+}
+
+/* ══════════ 「本次没显示的词」分组 ══════════
+   按【原因】分组，不按阶段分 —— 「不在知识库」「已排除」是可操作的，
+   「AI 未采纳」不是。混在一起用户不知道该动哪个。 */
+.missrow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px 0;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.missrow > b {
+  flex: none;
+  min-width: 64px;
+  font-weight: 700;
+}
+.missrow > span { overflow-wrap: anywhere; }
+
+/* ══════════ 右键菜单 ══════════
+   ⚠ 用 fixed 定位：clientX/clientY 就是视口坐标，能直接对上。
+     用 absolute 的话还得算 stream-body 的滚动偏移，多一处会错的地方。 */
+.ctxmenu {
+  position: fixed;
+  z-index: 60;
+  min-width: 132px;
+  padding: 4px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctrl);
+  box-shadow: 0 6px 18px rgba(47, 111, 181, .18);
+  display: flex;
+  flex-direction: column;
+}
+.ctxmenu button {
+  border: 0;
+  background: transparent;
+  border-radius: calc(var(--r-ctrl) - 3px);
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+.ctxmenu button:hover { background: var(--accent-soft); }
+
+/* ══════════ 一次性提示（撤销） ══════════
+   排除是单向门，必须给回来的路 —— 这条提示就是那条路。 */
+.toast {
+  position: fixed;
+  left: 10px; right: 10px; bottom: 44px;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 11px;
+  background: var(--card);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-ctrl);
+  box-shadow: 0 6px 18px rgba(47, 111, 181, .18);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.toast span { overflow-wrap: anywhere; }

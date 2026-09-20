@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>问了吗</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-dock="right">
+
+<!-- ══════════ 标题栏 ══════════ -->
+<header class="titlebar">
+  <div class="brand">
+    <span class="brand-name">问了吗</span>
+    <!-- ⚠ title 只是初始值，真正的说明由后端 auto_poll 的 hint 覆盖 ——
+         它会说清楚「还差多少秒」「为什么还没开始」，那些前端拼不出来。 -->
+    <button class="switch" id="sw-auto" data-on="false" data-busy="false"
+            title="自动通道：开着之后，你停手一会儿它就自己识别一次">
+      <span class="switch-dot"></span><span class="switch-label" id="sw-label">自动</span>
+    </button>
+  </div>
+  <div class="tb-actions">
+    <!-- 齿轮 = 操作台。⚠ 不能只画一个 ⚙ 就完事：
+         联调脚本靠 OCR 找控件，而 ⚙ 这类的符号 OCR 认不出来
+         （标题栏那四个窗口按钮就没法用 OCR 找，只能靠位置）。
+         所以图标后面带一个「设置」的文字标签 —— 好看是其次，
+         得让「点得到它」这件事可验证。 -->
+    <button class="ico ico-wide" id="btn-console" title="操作台：Key、知识库、屏蔽词、提示词">
+      <span class="ico-glyph">⚙</span><span class="ico-text">设置</span>
+    </button>
+    <button class="ico" id="btn-move"  title="移动 / 换边">⇱</button>
+    <button class="ico" id="btn-min"   title="折叠">—</button>
+    <button class="ico" id="btn-max"   title="展开">▢</button>
+    <button class="ico ico-close" id="btn-close" title="关闭">✕</button>
+  </div>
+</header>
+
+<!-- ══════════ 停靠菜单 ══════════ -->
+<div class="popover" id="dockmenu" hidden>
+  <button data-edge="top">↑&nbsp; 停靠顶部</button>
+  <button data-edge="left">←&nbsp; 停靠左侧</button>
+  <button data-edge="right">→&nbsp; 停靠右侧</button>
+  <button data-edge="bottom">↓&nbsp; 停靠底部</button>
+</div>
+
+<!-- ══════════ 主视图：条目页 ══════════
+     ⚠ 分工是【动作在条目页，配置进操作台】，不是按新旧分。
+       这一页只留「现在要用的」：框选、立即识别、看解释。
+       所有设置（Key / 三档策略 / 导出目录 / 提示词 / 屏蔽词）都在操作台，
+       一个开关只有一处 —— 同一样东西摆两个地方，迟早有一处忘了刷新。 -->
+<main class="scroll" id="view-stream">
+
+  <!-- 1. 取词区域 -->
+  <section class="card">
+    <div class="card-head">
+      <h2 class="card-title">取词区域</h2>
+      <span class="pill" id="region-pill">未设置</span>
+    </div>
+    <p class="msg" id="region-text">还没框选。点下面按钮，框出笔记所在的那块屏幕。</p>
+    <div class="btn-row">
+      <button class="btn btn-ghost" id="btn-pick">框选区域</button>
+      <button class="btn btn-primary" id="btn-recognize">立即识别</button>
+    </div>
+  </section>
+
+  <!-- 2. 知识库【状态】—— 控件全在操作台，这里只说「现在是什么状况」。
+       ⚠ 右上角这两个是【跳转】，不是控件：库里有几条、现在哪一档策略，
+         真想知道细节的人点一下就到操作台了。这里放开关的话，
+         同一个策略就有了两处显示，迟早有一处忘了刷新。 -->
+  <section class="card">
+    <div class="card-head">
+      <h2 class="card-title">知识库</h2>
+      <div class="head-right">
+        <span class="pill" id="kb-count">库中 0 条</span>
+        <button class="btn btn-tiny" id="btn-kb-manage">管理</button>
+      </div>
+    </div>
+    <p class="msg" id="kb-policy-now">不重复解释</p>
+    <p class="msg" id="kb-msg">解释过的词会自动收进知识库，下次遇到就不再花钱问模型</p>
+  </section>
+
+  <!-- 3. 候选 / 条目流（内容由 app.js 渲染） -->
+  <section class="stream">
+    <div class="stream-head">
+      <h2 class="card-title">解释条目</h2>
+      <span class="pill" id="stream-count">0 条</span>
+    </div>
+    <div id="stream-body">
+      <p class="stream-note">还没识别。框选区域后点「立即识别」。</p>
+    </div>
+  </section>
+</main>
+
+<!-- ══════════ 操作台：所有设置都在这儿 ══════════ -->
+<main class="scroll" id="view-console" hidden>
+
+  <div class="console-head">
+    <button class="btn btn-ghost btn-tiny" id="btn-console-back">← 返回条目</button>
+    <h2 class="console-title">操作台</h2>
+  </div>
+
+  <!-- 1. 模型接入 -->
+  <section class="card">
+    <h2 class="card-title">模型接入</h2>
+    <label class="field-label" for="api-key">API Key</label>
+    <div class="row">
+      <input id="api-key" class="input" type="password" autocomplete="off" spellcheck="false">
+      <button class="btn btn-primary" id="btn-key">接入</button>
+    </div>
+    <div class="vendor" id="vendor" hidden>
+      <span class="vendor-badge">DS</span>
+      <span class="vendor-name">DeepSeek</span>
+      <span class="pill pill-ok">已接入</span>
+    </div>
+    <p class="msg" id="key-msg"></p>
+  </section>
+
+  <!-- 2. 知识库设置 -->
+  <section class="card">
+    <div class="card-head">
+      <h2 class="card-title">知识库设置</h2>
+      <span class="pill" id="kb-count-c">库中 0 条</span>
+    </div>
+
+    <!-- 这三个不是并列的开关，是同一个问题的三档答案：
+         「库里那条旧解释，你打算拿它怎么办？」
+         所以第 3 个的代价必须写在脸上 —— 它会把库外的词全部藏起来。
+
+         ⚠ 竖排 + 每档自带一句副标题，这两件事是一起做的，别只改一半。
+           横排的话三个 5 字标签各自折成两行，看起来像坏了
+           （v0.7 到 v0.8 一直是这样，见进展文档）。
+           竖排之后才腾得出地方说「什么时候该切这一档」，
+           否则用户切了有反应，却不知道该不该切。 -->
+    <div class="seg" id="kb-policy">
+      <button data-policy="dedupe" class="seg-btn">
+        <b>不重复解释</b><span>库里已有的直接用，不再问模型</span>
+      </button>
+      <button data-policy="repeat" class="seg-btn">
+        <b>可重复解释</b><span>忽略库，全部重新问一遍</span>
+      </button>
+      <button data-policy="whitelist" class="seg-btn">
+        <b>只解释库内</b><span>不在库里的词一概不显示</span>
+      </button>
+    </div>
+
+    <div class="row row-gap">
+      <input id="kb-dir" class="input" placeholder="导出目录">
+      <button class="btn" id="btn-dir">选择</button>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-ghost" id="btn-import">导入</button>
+      <button class="btn btn-ghost" id="btn-harvest">收纳历史</button>
+      <button class="btn btn-ghost" id="btn-export">导出 md</button>
+    </div>
+    <p class="msg" id="kb-msg-c">导入一份两栏 md；收纳历史把重新问出来的新版解释收编进库。</p>
+  </section>
+
+  <!-- 3. 自动通道（v0.13） -->
+  <section class="card">
+    <div class="card-head">
+      <h2 class="card-title">自动通道</h2>
+      <span class="pill" id="settle-now">15 秒</span>
+    </div>
+    <p class="msg">同一屏画面停住这么久，就自动识别一次。数字越短，卡片出得越快，跑的次数也越多。
+      <b>同一屏只跑一次</b> —— 画面不变就不会重复花钱。</p>
+
+    <!-- 横排四档。这里能横排是因为标签只有「15 秒」这种三四个字；
+         知识库那三档是 5 个字还带副标题，横排会折行，所以那边必须竖排。
+         代价：这里放不下副标题，所以上面那句 p.msg 得把话说全。 -->
+    <div class="seg seg-row" id="auto-settle">
+      <button data-settle="5"  class="seg-btn"><b>5 秒</b></button>
+      <button data-settle="15" class="seg-btn"><b>15 秒</b></button>
+      <button data-settle="30" class="seg-btn"><b>30 秒</b></button>
+      <button data-settle="60" class="seg-btn"><b>1 分钟</b></button>
+    </div>
+    <p class="msg" id="settle-msg">总开关在标题栏那个「自动」上。</p>
+  </section>
+
+  <!-- 4. 快捷键取词（v0.20 / 决策 50）
+       ⚠ 这是【第二条手动通道】，和框选并列：框选读的是屏幕上那块区域，
+         它读的是你在别处选中的那段字。两条共用同一条管线（硬约束 4）。 -->
+  <section class="card">
+    <div class="card-head">
+      <h2 class="card-title">快捷键取词</h2>
+      <span class="pill" id="hotkey-now">Ctrl+E</span>
+    </div>
+    <p class="msg">在飞书 / Obsidian 里<b>选中一段文字</b>，按这个键，它就解释你选中的那段。
+      <b>中英文都认</b> —— 和框选那条不一样，那条只认英文。</p>
+    <p class="msg">它会临时借用一下剪贴板把你选的字读走，<b>读完原样还回去</b>。
+      剪贴板里要是图片或文件（不是文字），它就不动手，免得弄丢你的东西。</p>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-hk-record">录制新快捷键</button>
+    </div>
+    <p class="msg" id="hotkey-msg"></p>
+  </section>
+
+  <!-- 5. 屏蔽词（决策 21 的集中管理界面，v0.11 补上） -->
+  <section class="card">
+    <div class="card-head">
+      <h2 class="card-title">屏蔽词</h2>
+      <span class="pill" id="blk-count">0 个</span>
+    </div>
+    <p class="msg">加进来的词<b>永远不解释</b>，也不会发给模型。条目上右键「不再解释该词」是同一个名单。</p>
+    <div class="row">
+      <input id="blk-input" class="input" placeholder="输入要屏蔽的词，如 RAG"
+             autocomplete="off" spellcheck="false">
+      <button class="btn btn-primary" id="btn-blk-add">添加</button>
+    </div>
+    <div id="blk-list" class="blk-list"></div>
+    <p class="msg" id="blk-msg"></p>
+  </section>
+
+  <!-- 6. System Prompt。
+       ⚠ v0.20 起是【两份】，两条通道各用各的。合并成一份的话，
+         中文那套规则会被自动通道用上 —— 而「自动通道维持只认英文」
+         正是这次改动划下的硬边界（决策 50）。 -->
+  <section class="card">
+    <div class="card-head">
+      <h2 class="card-title">System Prompt</h2>
+      <button class="btn btn-tiny" id="btn-prompt-toggle">展开</button>
+    </div>
+    <div id="prompt-body" hidden>
+      <!-- 横排两档，和「自动通道」那排一个形状（标签短，放得下）。
+           data-active 由 app.js 的 markPromptWhich 维护，样式走
+           .seg-btn[data-active="true"]（和知识库三档、等待秒数四档同一套）。 -->
+      <div class="seg seg-row" id="prompt-which">
+        <button data-which="region" class="seg-btn" data-active="true"><b>框选 / 自动</b></button>
+        <button data-which="clip"   class="seg-btn" data-active="false"><b>快捷键</b></button>
+      </div>
+      <textarea id="prompt-text" class="textarea" spellcheck="false"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-ghost" id="btn-prompt-reset">恢复默认</button>
+        <button class="btn btn-ghost" id="btn-prompt-save">保存</button>
+      </div>
+    </div>
+    <p class="msg" id="prompt-msg">使用默认提示词</p>
+  </section>
+</main>
+
+<!-- ══════════ 底部诊断条 ══════════ -->
+<footer class="diag" id="diag">窗口状态读取中…</footer>
+
+<!-- ══════════ 条目右键菜单 ══════════ -->
+<!-- ⚠ 用 hidden 属性开关，别用 style.display ——
+     style.css 里有 `[hidden] { display: none !important; }`，
+     那条规矩就是为了让这种事只有一个说法。 -->
+<div class="ctxmenu" id="ctxmenu" hidden>
+  <button id="ctx-exclude">不再解释该词</button>
+</div>
+
+<!-- ══════════ 一次性提示（撤销用） ══════════ -->
+<div class="toast" id="toast" hidden>
+  <span id="toast-text"></span>
+  <button class="btn btn-tiny" id="toast-act" hidden></button>
+</div>
+
+<!-- ══════════ 关闭确认 ══════════
+     ⚠ 这里【故意不用】原生 confirm()，两个理由：
+       1. 它长什么样、落在哪儿，是 WebView2 说了算的 —— 面板是一条
+          520×1600 的窄栏，原生对话框按视口定位，看上去就像挂在边上的一条提示
+       2. 它会把 JS 整个阻塞住，而「阻塞」这件事在本项目是有前科的
+          （见 main.py 里那两条关于非守护线程的说明）
+     换成页面内的模态框之后：位置由我们定（.overlay 已经居中），
+     样子按 Windows 消息框来，也能被联调脚本 OCR 到。 -->
+<div class="overlay" id="closebox" hidden>
+  <div class="msgbox" role="dialog" aria-modal="true" aria-labelledby="msgbox-title">
+    <h2 class="msgbox-title" id="msgbox-title">关闭问了吗</h2>
+    <div class="msgbox-body">
+      <span class="msgbox-icon" aria-hidden="true">?</span>
+      <p class="msgbox-text">关闭后，今日的检索内容可以导出成 md。确定现在关闭吗？</p>
+    </div>
+    <div class="msgbox-btns">
+      <button class="btn btn-primary" id="close-yes">确定</button>
+      <button class="btn" id="close-no">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ 首次使用告知 ══════════ -->
+<div class="overlay" id="notice" hidden>
+  <div class="dialog">
+    <h2 class="dialog-title">开始之前</h2>
+    <p class="dialog-text">这个工具会把识别到的笔记文字，发送给<b>你自己配置的 AI 模型</b>来生成解释。</p>
+    <ul class="dialog-list">
+      <li>截屏与文字识别<b>全部在本机完成</b>，不外传</li>
+      <li>只有识别出的文字会发给模型厂商</li>
+      <li>解释过的术语和解释会<b>保存在本机的知识库文件里</b>，下次遇到同一个词就不再问模型</li>
+      <li>API Key 存在本机，请勿在公用电脑上使用</li>
+    </ul>
+    <button class="btn btn-primary btn-block" id="btn-notice-ok">我知道了</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
