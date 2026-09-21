@@ -748,6 +748,9 @@ def main():
     print("=" * 62)
     if not BOX.require_clean_screen():
         return 1
+    # ★ 先验尺子：`BOX.check` 是全部断言的唯一出口，它坏了几百项一起变绿。
+    if not BOX.gate_check_selftest():
+        return 2
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), EchoFake)
     srv.daemon_threads = True

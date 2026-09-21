@@ -130,6 +130,96 @@ def check(name, cond, detail="", hint=""):
     return cond
 
 
+def _selftest_check():
+    """`check()` 自己的反向对照。返回「哪里不对」的清单（空 = 全对）。
+
+    ★★ 这一段【故意一行都不用 check()】—— 被验的就是它。
+       拿 `check()` 来验 `check()`，等于让被告自己坐审判席：
+       它要是坏成了「无条件 `_ok += 1`」，下面每条自检会跟着一起变绿。
+
+    ────────────────────────────────────────────────────────
+    为什么它值得单独写一段（不是预防性设计）：
+
+    `check()` 是**全部 400 项断言共用的唯一出口**。别的东西坏了，
+    红的是它自己那几条；`check()` 坏了，是 **400 项一起变绿** ——
+    而且**连「项数对账」都拦不住**，因为 `全部回归.py` 汇总行里那个
+    「通过 N 项」的 N，就是从这个 `_ok` 数出来的。
+    它同时污染**判据**和**对判据的对账**，是这份报告里唯一一处
+    「没有任何别的机制能兜住」的地方。
+
+    验四件事（都是我自己会写错的那种）：
+      ① 计数器往哪边走 —— 真条件 `_ok+1`、假条件 `_fail+1`
+      ② 返回值 = `cond` —— 调用方靠它分支（`if not check(...): return`）
+      ③ 打印格式 —— 这是和 `全部回归.py` 的【接口约定】：
+         那边拿 `^\\s*\\[不通过\\]\\s*(.*)$` 挑失败明细，前缀一改，
+         明细就**静默消失**，报告里只剩一个孤零零的数字
+      ④ `detail` 两条路径都要打出来（v0.20.1 刚立的规矩：它是中性观察）
+    """
+    global _ok, _fail
+    bad = []
+    saved = (_ok, _fail)
+
+    def probe(cond, **kw):
+        """跑一次 check()，返回 (通过数, 不通过数, 返回值, 打出来的字)。"""
+        global _ok, _fail
+        _ok = _fail = 0
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ret = check("自检用的名字", cond, **kw)
+        return _ok, _fail, ret, buf.getvalue()
+
+    def want(label, got, exp):
+        if got != exp:
+            bad.append(f"{label} —— 是 {got!r}，该是 {exp!r}")
+
+    # ①② 计数器与返回值
+    o, f, ret, _ = probe(True)
+    want("真条件该让「通过」+1", (o, f), (1, 0))
+    want("真条件该返回真", ret, True)
+
+    o, f, ret, _ = probe(False)
+    want("假条件该让「不通过」+1", (o, f), (0, 1))
+    want("假条件该返回假", ret, False)
+
+    # ③ 打印格式（和 `全部回归.py` 的接口约定）
+    _, _, _, out = probe(False, hint="该往哪看")
+    want("假条件该打出 [不通过] 前缀", "[不通过]" in out, True)
+    want("假条件该打出 hint", "该往哪看" in out, True)
+
+    _, _, _, out = probe(True, hint="该往哪看")
+    want("真条件不该打 [不通过]", "[不通过]" in out, False)
+    want("真条件不该打 hint", "该往哪看" in out, False)
+
+    # ④ detail 是中性观察 —— 两条路径都要打
+    for c in (True, False):
+        _, _, _, out = probe(c, detail="等了 3.0s")
+        want(f"detail 在「{'通过' if c else '不通过'}」那一行上也要打出来",
+             "等了 3.0s" in out, True)
+
+    _ok, _fail = saved
+    return bad
+
+
+def gate_check_selftest():
+    """闸门：`check()` 自检不过就【不开跑】。返回 True = 可以跑。
+
+    ⚠ 为什么不过就整个不跑，而不是「记一条不通过再接着跑」：
+      尺子坏了的时候，量出来的数不只是「可能错」，而是**没有意义** ——
+      接着跑只会产出一屏看着正常的假数据，而那份假数据正是
+      「修完了、验过了」这句话的唯一依据。
+      真跑出来反而更坏：一个全绿的假报告比一个不跑更接近撒谎。
+    """
+    bad = _selftest_check()
+    if not bad:
+        print("✓ check() 自检通过（计数器 / 返回值 / 打印格式，两个方向都验了）")
+        return True
+    print("⚠⚠ check() 自检没过 —— 它是所有断言唯一的出口，")
+    print("   它坏了的话下面每一条都会变绿，所以【不跑了】：")
+    for b in bad:
+        print(f"    · {b}")
+    return False
+
+
 # ── 找窗口：一律按「标题 + 属于指定 pid」找 ────────────────────
 def find_window(title, pid=None, timeout=25.0):
     deadline = time.time() + timeout
@@ -898,6 +988,11 @@ def main():
     print("=" * 62)
     if not require_clean_screen():
         return 1
+    # ★ 验尺子。摆在 `require_clean_screen()` 【之后】是有意的：
+    #   锁屏时 `全部回归.py` 对本脚本报的是「整段没跑」，
+    #   这时候打一句「✓ check() 自检通过」就与那句话对不上了。
+    if not gate_check_selftest():
+        return 2
 
     # ★ 先把两条【从没执行过】的分支跑掉（L.11 ④）。它们不需要窗口，
     #   放在这里是因为下面每条 `if not check(...): return` 都可能提前交卷 ——
