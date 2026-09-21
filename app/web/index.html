@@ -227,6 +227,7 @@
       <div class="seg seg-row" id="prompt-which">
         <button data-which="region" class="seg-btn" data-active="true"><b>框选 / 自动</b></button>
         <button data-which="clip"   class="seg-btn" data-active="false"><b>快捷键</b></button>
+        <button data-which="detail" class="seg-btn" data-active="false"><b>详情</b></button>
       </div>
       <textarea id="prompt-text" class="textarea" spellcheck="false"></textarea>
       <div class="btn-row">
@@ -273,6 +274,36 @@
     <div class="msgbox-btns">
       <button class="btn btn-primary" id="close-yes">确定</button>
       <button class="btn" id="close-no">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ 查看详情：多轮对话（v0.30）══════════
+     ⚠ 它是【盖在面板上的】，不是一个新窗口 —— 窗口尺寸一个像素都不许动。
+       面板只有 520 物理像素宽（≈346 CSS px，约一个巴掌），
+       改窗口几何去腾地方的话，用户桌面上那一条会跟着挪，而他在飞书里正干着活。
+       （2026-09-21 用户拍板：「就盖在面板上，不动窗口尺寸」）
+
+     ⚠ 内容【不落盘】。同一条会话只在 app 进程内存里活着，关掉就没了 ——
+       所以这里没有「历史记录」这种入口，也不该有人后来加一个。 -->
+<div class="overlay" id="detailbox" hidden>
+  <div class="chat" role="dialog" aria-modal="true" aria-labelledby="chat-title">
+    <div class="chat-head">
+      <h2 class="chat-title" id="chat-title">查看详情</h2>
+      <!-- 「重新问」= 丢掉这条会话重开一轮（会再花一次钱）。
+           ⚠ 它和「关闭」不是一个意思：关闭只是把对话框收起来，会话还在内存里，
+             再点同一个词的「查看详情」立刻就有内容、不花钱。 -->
+      <button class="btn btn-tiny" id="chat-again" title="丢掉这次的对话，从头再问一遍（会再花一次钱）">重新问</button>
+      <button class="ico" id="chat-close" title="关闭">✕</button>
+    </div>
+    <div class="chat-term" id="chat-term"></div>
+    <div class="chat-body" id="chat-body"></div>
+    <p class="msg" id="chat-msg"></p>
+    <div class="chat-foot">
+      <textarea id="chat-input" class="chat-input" rows="1"
+                placeholder="继续问…（Enter 发送，Shift+Enter 换行）"
+                spellcheck="false"></textarea>
+      <button class="btn btn-primary" id="chat-send">发送</button>
     </div>
   </div>
 </div>

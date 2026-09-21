@@ -192,6 +192,66 @@ def _explain_http(resp):
     return AiError(f"请求失败（HTTP {code}）", resp.text[:300])
 
 
+def _post_chat(body, api_key):
+    """POST /chat/completions，把各种失败翻译成人话。
+
+    ★ `explain()` 和 `chat()` **共用这一份**。两条路的失败形状完全一样：
+      超时、连不上、401/402/429/5xx、回复结构不对。各写一遍的话，
+      哪天有人把 402 的文案改得更清楚，只会改到其中一条上，
+      另一条的报错就跟不上 —— 而且不报错，只是两处说的话不一样。
+      （同 `kb.canon()` 的「唯一实现处」）
+
+    ⚠ `api_key` 是**单独一个参数**，不许塞进 body 里再过滤掉 ——
+      那种写法一旦哪天过滤条件写漏，Key 就跟着请求体一起
+      被 `json=` 发出去或者被打进日志了。
+
+    返回 {"ok": True, "content": str, "usage": {...}, "seconds": float}
+      或 {"ok": False, "msg": 人话, "detail": 原始信息}。
+    """
+    t0 = time.perf_counter()
+    try:
+        resp = requests.post(
+            BASE_URL + "/chat/completions",
+            headers={
+                "Authorization": "Bearer " + (api_key or ""),
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=TIMEOUT,
+        )
+    except requests.Timeout:
+        return {"ok": False, "msg": f"等了 {TIMEOUT} 秒还没回，超时了"}
+    except requests.RequestException as e:
+        return {"ok": False, "msg": "连不上 DeepSeek，检查一下网络", "detail": str(e)}
+
+    if resp.status_code != 200:
+        err = _explain_http(resp)
+        return {"ok": False, "msg": err.msg, "detail": err.detail}
+
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return {"ok": False, "msg": "回复的结构和预期对不上",
+                "detail": f"{e}｜{resp.text[:300]}"}
+
+    return {
+        "ok": True,
+        "content": content,
+        "usage": data.get("usage") or {},
+        "seconds": round(time.perf_counter() - t0, 2),
+    }
+
+
+def _usage_of(u):
+    """OpenAI 那套 usage 字段名 → 我们自己那三个数。"""
+    return {
+        "in": u.get("prompt_tokens"),
+        "out": u.get("completion_tokens"),
+        "total": u.get("total_tokens"),
+    }
+
+
 def explain(api_key, system_prompt, payload, mode="region"):
     """跑 ②。
 
@@ -215,47 +275,80 @@ def explain(api_key, system_prompt, payload, mode="region"):
         "response_format": {"type": "json_object"},
     }
 
-    t0 = time.perf_counter()
-    try:
-        resp = requests.post(
-            BASE_URL + "/chat/completions",
-            headers={
-                "Authorization": "Bearer " + api_key,
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=TIMEOUT,
-        )
-    except requests.Timeout:
-        return {"ok": False, "msg": f"等了 {TIMEOUT} 秒还没回，超时了"}
-    except requests.RequestException as e:
-        return {"ok": False, "msg": "连不上 DeepSeek，检查一下网络", "detail": str(e)}
-
-    if resp.status_code != 200:
-        err = _explain_http(resp)
-        return {"ok": False, "msg": err.msg, "detail": err.detail}
+    r = _post_chat(body, api_key)
+    if not r["ok"]:
+        return r
 
     try:
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return {"ok": False, "msg": "回复的结构和预期对不上", "detail": f"{e}｜{resp.text[:300]}"}
-
-    try:
-        entries = parse_entries(content)
+        entries = parse_entries(r["content"])
     except AiError as e:
         return {"ok": False, "msg": e.msg, "detail": e.detail}
 
-    usage = data.get("usage") or {}
     return {
         "ok": True,
         "entries": entries,
-        "seconds": round(time.perf_counter() - t0, 2),
-        "usage": {
-            "in": usage.get("prompt_tokens"),
-            "out": usage.get("completion_tokens"),
-            "total": usage.get("total_tokens"),
-        },
+        "seconds": r["seconds"],
+        "usage": _usage_of(r["usage"]),
+    }
+
+
+# ══════════ 「查看详情」的多轮对话（v0.30）══════════
+
+# 一次回答的上限。卡片那句解释走的是 explain 的 2000（一次要装下几十条），
+# 这一条只装【一段】，但它要的是「详细」—— 1500 大约是一千多字中文，
+# 够讲透一个术语又不至于写成教科书。详见 prompt.DEFAULT_PROMPT_DETAIL 的长度那段。
+DETAIL_MAX_TOKENS = 1500
+
+
+def chat(api_key, system_prompt, msgs):
+    """多轮问答。`msgs` 是 [{"role": "user"|"assistant", "text": ...}]。
+
+    ★ 它和 `explain()` 是**两条路**，别合并：
+
+      · `explain()` —— 管线 ②。一次调用筛完 + 写完所有词条，
+        输出固定 JSON，上面那条硬约束 2 管的就是它。
+      · `chat()`    —— 一问一答，输出是**大白话**，不是 JSON。
+
+      「多轮天然就是问几次调几次」，硬约束 2 说的不是这里。
+
+    ⚠ **不要 `response_format: json_object`** —— 那是 explain 要的。
+      这里加了的话模型会返回一个 JSON 字符串，对话框里就会显示
+      `{"回答": "..."}` 这种东西。
+
+    ⚠ system 由调用方【每次现拼】传进来，不跟着 msgs 一起存 ——
+      用户在操作台改了详情提示词之后，下一句追问就该用新的那份（决策 37）。
+    """
+    if not api_key:
+        return {"ok": False, "msg": "还没填 API Key"}
+    if not msgs:
+        return {"ok": False, "msg": "还没问问题"}
+
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "system", "content": system_prompt}] + [
+            {"role": m["role"], "content": m["text"]} for m in msgs
+        ],
+        # 和 explain 一样偏低：要的是稳定。
+        # ⚠ 但【比 explain 高一点】—— 追问「举个例子」这种，太低会答得很干瘪。
+        "temperature": 0.3,
+        "max_tokens": DETAIL_MAX_TOKENS,
+    }
+
+    r = _post_chat(body, api_key)
+    if not r["ok"]:
+        return r
+
+    text = (r["content"] or "").strip()
+    # ⚠ 空回复要当失败报出来。当成成功返回的话，对话框里会冒出一个
+    #   没有内容的空气泡，用户只能猜「是卡了还是就这样」。
+    if not text:
+        return {"ok": False, "msg": "模型这次没说出来话（回复是空的）"}
+
+    return {
+        "ok": True,
+        "text": text,
+        "seconds": r["seconds"],
+        "usage": _usage_of(r["usage"]),
     }
 
 

@@ -33,6 +33,7 @@ for _s in (sys.stdout, sys.stderr):
 import ai                                                        # noqa: E402
 import auto as auto_mod                                          # noqa: E402
 import capture                                                   # noqa: E402
+import detail as detail_mod                                      # noqa: E402
 import hotkey as hotkey_mod                                      # noqa: E402
 import kb                                                        # noqa: E402
 import ocr                                                       # noqa: E402
@@ -108,6 +109,7 @@ DEFAULT_SETTINGS = {
     "kb_dir": "",                 # 导出目录。空 = 用 kb.default_dir()
     "system_prompt": "",          # 空 = 用默认（框选/自动通道，只认英文）
     "system_prompt_any": "",      # 空 = 用默认（快捷键通道，中英不限）。v0.20
+    "system_prompt_detail": "",   # 空 = 用默认（查看详情对话框）。v0.30
     "hotkey": hotkey_mod.DEFAULT_COMBO,   # 显示写法，如 "ctrl+e"。v0.20
     "seen_notice": False,
     "region": None,               # [left, top, width, height] 物理坐标
@@ -275,6 +277,22 @@ class Api:
         if _seed:
             self.hotkey.seed(_seed)
 
+        # 「查看详情」的多轮会话（v0.30）。
+        #
+        # ⚠ **只在内存里，不落盘** —— 用户拍板「这次开着就记住，关程序就忘」。
+        #   状态机住在 app/detail.py（那边不碰 settings / HTTP / pywebview，
+        #   好在联调脚本里不起窗口就能验）。
+        self.chats = detail_mod.Chats()
+
+        # ⚠ 这把锁【acquire(blocking=False)】，绝不阻塞等待 ——
+        #   `explain` 和 `detail` 都是几十秒的调用，而每次 js_api 调用
+        #   都是 pywebview 新开的一条【非守护线程】。阻塞着等的话，
+        #   连点几下就攒出一堆卡住的非守护线程，正好把 `os._exit(0)`
+        #   当初要绕开的问题原样搬回来（同 `_run_lock` 那段的告诫）。
+        #   抢不到就直接告诉用户「上一条还在答」—— 前端那边也禁着发送键，
+        #   正常走不到这里，它挡的是竞态。
+        self._chat_lock = threading.Lock()
+
     # ══════════ 窗口 ══════════
     def dock(self, edge):
         ok = self.sh.dock(edge)
@@ -371,6 +389,8 @@ class Api:
         # 第二份默认提示词（快捷键通道用，中英不限）。两份都要给 ——
         # 前端那个「切换编辑哪一份」的控件要靠它俩把自己填满。
         s["default_prompt_any"] = prompt_mod.DEFAULT_PROMPT_ANY
+        # 第三份（查看详情对话框用，多轮问答）。v0.30
+        s["default_prompt_detail"] = prompt_mod.DEFAULT_PROMPT_DETAIL
         # 快捷键。★ 给的是【后端生效值】而不是 settings 里存的那个 ——
         #   注册失败时 Hotkey 会保留旧组合，前端照 settings 画就会显示一个
         #   实际没生效的键（同 markSettle 用后端回读值）。
@@ -389,15 +409,20 @@ class Api:
         return s
 
     def save_prompt(self, text, which="region"):
-        """存一份系统提示词。which: "region"（框选/自动）| "clip"（快捷键）。
+        """存一份系统提示词。
 
-        两份是【各自独立】的，各存各的键、各跟各的默认值比。
+        which: "region"（框选/自动）| "clip"（快捷键）| "detail"（查看详情）。
+
+        三份是【各自独立】的，各存各的键、各跟各的默认值比。
         合并成一份的话，中文那套规则会被自动通道用上 ——
-        而自动通道维持只认英文是这次改动的硬边界（决策 50）。
+        而自动通道维持只认英文是这次改动的硬边界（决策 50）；
+        detail 那份要的更是【反过来】的东西（详细展开 vs 一句话）。
         """
         text = (text or "").strip()
         if which == "clip":
             dflt, key = prompt_mod.DEFAULT_PROMPT_ANY, "system_prompt_any"
+        elif which == "detail":
+            dflt, key = prompt_mod.DEFAULT_PROMPT_DETAIL, "system_prompt_detail"
         else:
             which, dflt, key = "region", prompt_mod.DEFAULT_PROMPT, "system_prompt"
         # 和默认一模一样就存空 —— 这样以后默认提示词改进了，用户能自动跟上，
@@ -537,13 +562,20 @@ class Api:
     def _system_prompt(self, mode):
         """这条通道该用哪份系统提示词。**唯一实现处**，别在别处再判一次。
 
-        region（框选/自动）→ 只认英文那份；clip（快捷键）→ 中英不限那份。
-        两份都可以被用户在操作台改，改过的存在 settings 里；
+        region（框选/自动）→ 只认英文那份；clip（快捷键）→ 中英不限那份；
+        detail（查看详情对话框）→ 多轮问答那份。
+        三份都可以被用户在操作台改，改过的存在 settings 里；
         **为空 = 用默认**（同决策 37 的语义）。
+
+        ⚠ detail 这份是【每次发请求时现读】的，不跟着会话一起存 ——
+          用户在对话框开着的时候改了提示词，下一句追问就该用新的那份。
         """
         if mode == "clip":
             return (self.settings.get("system_prompt_any")
                     or prompt_mod.DEFAULT_PROMPT_ANY)
+        if mode == "detail":
+            return (self.settings.get("system_prompt_detail")
+                    or prompt_mod.DEFAULT_PROMPT_DETAIL)
         return (self.settings.get("system_prompt")
                 or prompt_mod.DEFAULT_PROMPT)
 
@@ -632,6 +664,165 @@ class Api:
               f"tokens {u.get('in')}+{u.get('out')}={u.get('total')}　"
               f"入库 {n} 条（{policy}）", flush=True)
         return r
+
+    # ══════════ 查看详情：多轮对话（v0.30）══════════
+    #
+    # 卡片上点「查看详情」→ 弹对话框 → 先拿一段长解释 → 可以接着追问。
+    #
+    # ★ 它【不走管线】。管线指的是「截屏/取词 → ① → ③ → ② → 上屏」，
+    #   而这里输入是用户手指点的那个词、输出是一段对话文字，跟卡片流无关。
+    #   所以它不算「第二份管线」（硬约束 4 管的是那个）。
+    #
+    # ⚠ 会话【只在内存里】：同一个词第二次点开直接给上次那段，不再花钱；
+    #   关掉程序就全忘了。这是 2026-09-21 用户拍板的，别顺手加持久化。
+    def _detail_turn(self, key, ask, first=False):
+        """跑一轮问答。成功 → 返回给前端的载荷；失败 → 原样返回 ai.chat 的错误。
+
+        ⚠ 这是**唯一**调 `ai.chat()` 的地方。`detail_open` / `detail_ask`
+          两个入口都从这里走 —— 两处各写一遍的话，「锁怎么拿」「用了就
+          追加进会话」这些事迟早只在一处做对。
+        """
+        rec = self.chats.get(key)
+        if rec is None:
+            return {"ok": False, "msg": "这条会话已经没了，重新打开一次详情"}
+
+        # 本轮要发出去的历史：把这次问的这句先接上，再截断。
+        pending = list(rec["msgs"])
+        if ask:
+            pending.append({"role": "user", "text": ask})
+
+        ctx, dropped = detail_mod.build_context(pending)
+
+        r = ai.chat(self.settings.get("api_key"), self._system_prompt("detail"), ctx)
+        if not r.get("ok"):
+            # ★ 失败【不写进会话】。写进去的话，用户重试一次就多一条
+            #   「我问了但没答」的孤儿 —— 而下一轮模型会看到自己上一句
+            #   没回话，很容易顺着往下编。
+            #   失败也不清会话：之前聊过的还在，重试接着聊就是了。
+            print(f"[AI·详情] 失败：{r.get('msg')}", flush=True)
+            return r
+
+        if ask:
+            self.chats.say(key, "user", ask)
+        self.chats.say(key, "assistant", r["text"])
+
+        u = r.get("usage") or {}
+        # ⚠ 每次都打 tokens。这一条通道是【用户主动一次一次点出来的】，
+        #   比自动通道更容易不知不觉问很多轮 —— 日志是唯一能事后算账的地方。
+        print(f"[AI·详情] {rec['term'][:30]!r} {'开' if first else '问'} "
+              f"{r['seconds']}s　tokens {u.get('in')}+{u.get('out')}={u.get('total')}"
+              + (f"　（超出上下文的 {dropped} 轮已丢）" if dropped else ""),
+              flush=True)
+
+        return {
+            "ok": True,
+            "key": key,
+            "term": rec["term"],
+            "messages": self._detail_wire(rec),
+            "dropped": dropped,
+            "seconds": r["seconds"],
+            "usage": u,
+        }
+
+    @staticmethod
+    def _detail_wire(rec):
+        """会话记录 → 前端要的形状。
+
+        ⚠ 只挑 role / text 两个字段往前端送。整个 rec 直接扔过去的话，
+          `line`（用户笔记里的一整句）会跟着每一条消息重复发一遍 ——
+          面板很窄，桥也不便宜，没必要。
+        """
+        return [{"role": m["role"], "text": m["text"]} for m in rec["msgs"]]
+
+    def detail_open(self, key, term, line=""):
+        """打开某个词条的详情对话。
+
+        ★ **已经聊过的词直接给缓存，不再调模型**（用户拍板的口径：
+          「这次开着就记住，关程序就忘」）。所以这个方法的正常路径
+          是【一次网络都不发】的 —— 写反了（每次都重新开）的话，
+          功能看着好好的，只是每次点都白花一次钱。
+        """
+        key = (key or "").strip()
+        term = (term or "").strip()
+        if not key or not term:
+            return {"ok": False, "msg": "这个词没有标识，没法查详情"}
+
+        # ── 缓存命中：一次网络都不发 ──────────────────────
+        if self.chats.has(key):
+            rec = self.chats.get(key)
+            return {"ok": True, "key": key, "term": rec["term"],
+                    "messages": self._detail_wire(rec),
+                    "dropped": 0, "cached": True}
+
+        # ── 闸门：没 Key 就别开这个头 ─────────────────────
+        # ⚠ 必须【开之前】拦。放进 _detail_turn 里也能拦住，
+        #   但那时会话已经建好了 —— 用户会看到一个空对话框配一句
+        #   「还没填 API Key」，而他根本没地方填（操作台在对话框底下盖着）。
+        if not self.settings.get("api_key"):
+            return {"ok": False, "msg": "还没填 API Key —— 先在操作台接上模型"}
+
+        if not self._chat_lock.acquire(blocking=False):
+            return {"ok": False, "msg": "上一条还在答，等一下再点"}
+
+        try:
+            self.chats.start(key, term, line)
+            r = self._detail_turn(key, detail_mod.seed_question(term, line), first=True)
+            if not r.get("ok"):
+                # ⚠ 第一次就失败 → 把这条【空会话】删掉。
+                #   留着的话，用户再点一次会被缓存命中，直接得到一个
+                #   空对话框且**永远不再重试** —— 一次网络抖动就把这个词
+                #   钉死在「没有内容」上，还看不出为什么。
+                self.chats.reset(key)
+                return r
+            r["cached"] = False
+            return r
+        finally:
+            self._chat_lock.release()
+
+    def detail_ask(self, key, text):
+        """在已有的会话里追问一句。"""
+        key = (key or "").strip()
+        text = (text or "").strip()
+        if not text:
+            return {"ok": False, "msg": "先写点什么再发"}
+
+        # ⚠ 会话不在 → 【不新建】。新建的话就是一条没有第一句、
+        #   模型不知道在聊哪个词的孤儿对话；而且它会以 key 为名
+        #   混进缓存，之后用户点这个词的「查看详情」直接命中它。
+        if not self.chats.has(key):
+            return {"ok": False, "msg": "这条会话已经没了，重新打开一次详情"}
+
+        if not self.settings.get("api_key"):
+            return {"ok": False, "msg": "还没填 API Key"}
+
+        if not self._chat_lock.acquire(blocking=False):
+            return {"ok": False, "msg": "上一条还在答，等一下"}
+
+        try:
+            return self._detail_turn(key, text)
+        finally:
+            self._chat_lock.release()
+
+    def detail_reset(self, key, term="", line=""):
+        """丢掉这条会话，重新问一遍（**会重新花钱**）。
+
+        ⚠ 存在的理由：模型第一次答跑偏了，用户得有路可走。
+          没有它的话，这条会话这一整轮程序生命周期都钉死在那个答案上，
+          唯一的出路是重启程序 —— 那是个死胡同，不是「省了一次调用」。
+        """
+        key = (key or "").strip()
+        if not key:
+            return {"ok": False, "msg": "这个词没有标识，没法重问"}
+        # ⚠ 先把它原来的 term / line 捞出来再丢。只丢不捞的话，前端必须
+        #   把这两个值原样再传一遍 —— 而「重新问」这个按钮在对话【框里】，
+        #   它手上只有 key。捞不出来就得让前端另存一份，那又是一处会分叉的副本。
+        rec = self.chats.get(key)
+        if rec:
+            term = term or rec["term"]
+            line = line or rec["line"]
+        self.chats.reset(key)
+        print(f"[AI·详情] 丢掉 {key!r} 的会话，重新问一遍", flush=True)
+        return self.detail_open(key, term, line)
 
     # ══════════ 自动通道 ══════════
     # 后端只负责「到点了」；真正跑管线的是【前端】，调的是它自己那个

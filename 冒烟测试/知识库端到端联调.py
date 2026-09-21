@@ -923,8 +923,12 @@ def run(app, note):
 
     step("⑥ 自动收录：模型答过的词，这一轮就该进库了")
     row = db("SELECT explanation FROM terms WHERE key=?", (kb_mod.canon(EXCLUDE_TERM),))
+    # ⚠ `detail` 是【两路都打】的（`框选联调.check`）。这句话只有没进库时才成立，
+    #   直接写进 detail 会让【通过】那一行上说「没进库的话…」——
+    #   照本文件 :920 已经在用的写法，不进库时才有话说。
     BOX.check(f"「{EXCLUDE_TERM}」已经自动进了库（dedupe 模式）", bool(row),
-              "没进库的话，「不重复解释」的省钱承诺要等用户手动点一次才开始生效")
+              "" if row else "没进库的话，「不重复解释」的省钱承诺"
+                             "要等用户手动点一次才开始生效")
     if row:
         BOX.check("存的是这一轮模型给的那版",
                   f"第 1 轮解释" in row[0]["explanation"], row[0]["explanation"][:40])

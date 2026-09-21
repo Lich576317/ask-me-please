@@ -40,6 +40,7 @@
     bindSettle();
     bindConsole();
     bindStream();
+    bindChat();
     bindPrompt();
     bindAuto();
     bindHotkey();
@@ -710,7 +711,11 @@
       ? '<span class="pill pill-kb">来自知识库</span>'
       : (explanation ? '<span class="pill pill-plain">AI 新解</span>' : '');
 
-    return `<article class="entry" data-term="${esc(term)}" data-key="${esc(it.key)}">
+    /* ⚠ `data-line` 是给「查看详情」用的，而且是【只有这里才知道】的东西：
+       `terms` 表里没存上下文（见 kb.py 的 schema），出了这一屏就再也拿不到了。
+       详情对话框要拿它当第一句的语境（「它出现在这段话里：…」）。 */
+    return `<article class="entry" data-term="${esc(term)}" data-key="${esc(it.key)}"
+                     data-line="${esc(it.line || '')}">
       <div class="entry-head">
         <div class="entry-term"${clipped ? ` title="${esc(term)}"` : ''}>${esc(title)}</div>${pill}
       </div>
@@ -718,6 +723,10 @@
       ${explanation
           ? `<p class="entry-body">${esc(explanation)}</p>`
           : `<p class="entry-src">${esc(it.line)}</p>`}
+      <div class="entry-foot">
+        <button class="btn btn-tiny" data-more="${esc(it.key)}"
+                title="让 AI 把这个词讲详细些，还能接着追问">查看详情</button>
+      </div>
     </article>`;
   }
 
@@ -1139,6 +1148,16 @@
     });
 
     body.addEventListener('click', async (e) => {
+      // 「查看详情」（v0.30）。走委托的理由和右键菜单一样：卡片是
+      // 整体 innerHTML 重绘的（①② 各画一次），逐张绑定第一次重绘后就全失效。
+      const more = e.target.closest('[data-more]');
+      if (more) {
+        const card = more.closest('.entry[data-key]') || {};
+        openDetail(more.dataset.more,
+                   (card.dataset && card.dataset.term) || '',
+                   (card.dataset && card.dataset.line) || '');
+        return;
+      }
       if (e.target.id === 'miss-to-repeat') {
         const r = await api().set_kb_policy('repeat');
         markPolicy('repeat'); renderKb(r);
@@ -1211,6 +1230,211 @@
     toast._t = setTimeout(() => { t.hidden = true; }, 6000);
   }
 
+  /* ══════════ 查看详情：多轮对话（v0.30）══════════
+     卡片上点「查看详情」→ 盖一层对话框（**不动窗口几何**）→
+     先拿一段长解释 → 可以接着追问。
+
+     ⚠ 会话在【后端内存里】（app/detail.py），前端一份都不存 ——
+       前端存一份的话，「哪个词聊到哪儿了」就有了两处真相，
+       而刷新页面（改设置会重载）之后两边就对不上了。
+       所以这里只有一个 chatKey：**当前开着的是哪一条**。
+     ⚠ 关掉程序就全忘 —— 用户 2026-09-21 拍板。别加历史记录入口。 */
+  let chatKey = '';      // '' = 对话框没开
+  let chatBusy = false;  // 有一轮在飞
+
+  function bindChat() {
+    $('chat-close').addEventListener('click', closeChat);
+
+    // 点遮罩关掉。⚠ 只在【不在飞】的时候关 —— 关掉之后那一轮回来
+    //   会往一个已经关了的框里写，用户下次打开看到的是半截对话。
+    $('detailbox').addEventListener('click', (e) => {
+      if (e.target === $('detailbox') && !chatBusy) closeChat();
+    });
+
+    $('chat-send').addEventListener('click', sendChat);
+
+    // Enter 发送，Shift+Enter 换行。这是聊天框的通行做法，
+    // 缺了它每次都要把手挪到鼠标上 —— 而这个面板本来就是给「不想离开键盘」的人用的。
+    // ⚠ 中文输入法组字期间也会发 keydown（keyCode 229），那时不能抢回车，
+    //   否则「选词」那一下会被吃成发送。
+    $('chat-input').addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.shiftKey || e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      sendChat();
+    });
+    $('chat-input').addEventListener('input', growChatInput);
+
+    $('chat-again').addEventListener('click', () => {
+      if (chatBusy || !chatKey) return;
+      askAgain();
+    });
+
+    // Esc 关闭。和 #closebox 保持一致 —— 弹出层就该能被 Esc 关掉。
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if ($('detailbox').hidden || chatBusy) return;
+      closeChat();
+    });
+  }
+
+  /* 打开某个词条的详情。**这是「查看详情」按钮唯一的落点。** */
+  async function openDetail(key, term, line) {
+    key = (key || '').trim();
+    if (!key) return;
+
+    chatKey = key;
+    $('chat-term').textContent = term || key;
+    $('chat-body').innerHTML = '';
+    $('chat-msg').textContent = '';
+    $('chat-input').value = '';
+    // ⚠ 顺序不能反：先显示再量高度。元素还是 hidden 的时候
+    //   scrollHeight 是 0，growChatInput 会把输入框压成 0 像素高 ——
+    //   用户看到的是一个没有输入框的对话框，而且不报错。
+    $('detailbox').hidden = false;
+    growChatInput();
+
+    chatWait();
+    const r = await api().detail_open(key, term || '', line || '');
+    if (!r || !r.ok) { chatFail(r && r.msg); return; }
+    renderChat(r);
+    // 焦点给输入框：用户多半是要接着问的。
+    try { $('chat-input').focus(); } catch (e) { /* 拿不到焦点不该影响已经画好的内容 */ }
+  }
+
+  /* 「重新问」：丢掉这条会话重开一轮。**会再花一次钱**，所以按钮上有说明。 */
+  async function askAgain() {
+    chatWait();
+    const r = await api().detail_reset(chatKey);
+    if (!r || !r.ok) { chatFail(r && r.msg); return; }
+    renderChat(r);
+  }
+
+  async function sendChat() {
+    if (chatBusy || !chatKey) return;
+    const box = $('chat-input');
+    const text = box.value.trim();
+    if (!text) { $('chat-msg').textContent = '先写点什么再发'; return; }
+
+    box.value = '';
+    growChatInput();
+    chatWait();
+
+    const r = await api().detail_ask(chatKey, text);
+    if (!r || !r.ok) {
+      // ⚠ 把你刚发出去的那句【放回输入框】。一次超时就把用户打的一段字
+      //   吞掉，那是数据丢失 —— 不是「提示一下」，是让他重打一遍。
+      box.value = text;
+      growChatInput();
+      chatFail(r && r.msg);
+      return;
+    }
+    renderChat(r);
+  }
+
+  /* 会话 → 气泡。**每次都整体重画**，不做增量追加：
+     增量的话「失败那一轮没进会话」这件事就要在前端也维护一遍状态
+     （后端已经维护过了），两处迟早对不上，而对不上时屏幕上是对的、
+     重开一次就少一条 —— 最难查的那种。 */
+  function renderChat(r) {
+    const msgs = r.messages || [];
+    $('chat-body').innerHTML = msgs.map((m) => `
+      <div class="bubble ${m.role === 'user' ? 'bubble-user' : 'bubble-ai'}">${esc(m.text)}</div>
+    `).join('');
+
+    chatSettle();
+    $('chat-msg').textContent = chatStatus(r);
+    scrollChat();
+
+    // 回传给后端打印。这个窗口的 devtools 不是随手能开的，
+    // 而「AI 的答案到底有没有上屏」只有前端知道 —— 联调脚本靠这一行走。
+    // ⚠ 报的是【结构】（几条、各是什么角色），不是正文：
+    //   正文里有模型的任何输出，拿它当判据就是把不可信输入当断言。
+    try {
+      api().report('详情', JSON.stringify({
+        key: r.key || chatKey,
+        n: msgs.length,
+        roles: msgs.map((m) => (m.role === 'user' ? 'u' : 'a')).join(''),
+        cached: !!r.cached,
+        dropped: r.dropped || 0,
+      }));
+    } catch (e) { /* 上报失败不该影响已经画好的内容 */ }
+  }
+
+  /* 状态行。三件事挤一行，因为它们都是「刚这一轮怎么了」，
+     分三处写的话用户要在一屏里找三个地方。 */
+  function chatStatus(r) {
+    const bits = [];
+    if (r.cached) {
+      bits.push('这个词刚才问过了，直接给你看 —— 没有重新花钱。');
+    } else if (r.seconds) {
+      bits.push(`答完了（${r.seconds}s）。`);
+    }
+    // ★ 上下文被截断【必须说出来】。不说的话，用户会觉得模型
+    //   「怎么忘了前面聊的」，而界面上一切正常 —— 这正是本项目最怕的那种失败。
+    if (r.dropped) {
+      bits.push(`问得太多轮了，最早的 ${r.dropped} 轮没有发给模型（省点钱）。`);
+    }
+    return bits.join('　');
+  }
+
+  function chatWait() {
+    chatBusy = true;
+    $('chat-send').disabled = true;
+    $('chat-again').disabled = true;
+    // ⚠ 等待气泡【必须占位】。不占的话用户点完发送看到的是一片没变化的
+    //   框，只能靠「发送按钮变灰了」猜出程序收到了 —— 而按钮变灰这件事
+    //   在截图里看不出来、OCR 也读不出来，联调脚本验不了。
+    // ⚠ 先把上一条拿掉再插。不留神调两次（比如将来谁加了「重开时不清空」）
+    //   就会叠出两个「正在问模型…」，而它们看起来只是有点怪，不报错。
+    const old = $('chat-wait');
+    if (old) old.remove();
+    $('chat-body').insertAdjacentHTML('beforeend',
+      '<div class="bubble bubble-ai bubble-wait" id="chat-wait">正在问模型…</div>');
+    $('chat-msg').textContent = '正在问模型，通常十几秒…';
+    scrollChat();
+  }
+
+  /* 一轮结束（成了或没成）之后，把界面收回「可以再来一次」的状态。
+     ⚠ 成败两条路【都】要走这里。只在失败那边恢复的话，成功一次之后
+       发送按钮就永远是灰的 —— 而用户看到的只是「第二句发不出去了」。
+     ⚠ 「重新问」【不】按「屏上有没有内容」来禁 —— 第一轮就失败时
+       （网络抖一下、Key 不对）它正是唯一的重试入口。禁掉的话，
+       用户面前是一个空对话框配一句报错，唯一的出路是关掉再点一次卡片。 */
+  function chatSettle() {
+    chatBusy = false;
+    $('chat-send').disabled = false;
+    $('chat-again').disabled = !chatKey;
+  }
+
+  function chatFail(msg) {
+    const w = $('chat-wait');
+    if (w) w.remove();
+    chatSettle();
+    $('chat-msg').textContent = msg || '没问成，再试一次';
+  }
+
+  function closeChat() {
+    $('detailbox').hidden = true;
+    // ⚠ 只清本地的指针，**不去删后端的会话** —— 删了的话，用户
+    //   随手关一下再点开就要重新花钱，而产品说的是「这次开着就记住」。
+    chatKey = '';
+    chatBusy = false;
+  }
+
+  function scrollChat() {
+    const b = $('chat-body');
+    b.scrollTop = b.scrollHeight;
+  }
+
+  /* 输入框跟着字长高，最多约 4 行。
+     ⚠ 必须先置 auto 再读 scrollHeight —— 不置的话读到的是上一轮的高度，
+       框只会越长越高，缩不回去（输入框的经典写法错误）。 */
+  function growChatInput() {
+    const t = $('chat-input');
+    t.style.height = 'auto';
+    t.style.height = Math.min(t.scrollHeight, 92) + 'px';
+  }
+
   /* ══════════ System Prompt ══════════ */
   function bindPrompt() {
     const body = $('prompt-body');
@@ -1257,10 +1481,22 @@
     return (b && b.dataset.which) || 'region';
   }
 
+  /* 三份默认提示词。⚠ 这里和 markPromptWhich 里那份「用户存过的」表
+     必须【同进同退】—— 只改一处的症状是：切过去时编辑框里填的是 A 的默认，
+     而实际发出去的是 B，且界面上看不出任何异常。 */
+  const PROMPT_DEFAULTS = {
+    region: 'default_prompt',
+    clip:   'default_prompt_any',
+    detail: 'default_prompt_detail',
+  };
+  const PROMPT_SAVED = {
+    region: 'system_prompt',
+    clip:   'system_prompt_any',
+    detail: 'system_prompt_detail',
+  };
+
   function promptDefault(which) {
-    return which === 'clip'
-      ? (state.default_prompt_any || '')
-      : (state.default_prompt || '');
+    return state[PROMPT_DEFAULTS[which] || PROMPT_DEFAULTS.region] || '';
   }
 
   /* 切到某一份，并把编辑框换成它的内容。
@@ -1270,7 +1506,7 @@
     for (const b of document.querySelectorAll('#prompt-which .seg-btn')) {
       b.dataset.active = String(b.dataset.which === which);
     }
-    const saved = which === 'clip' ? state.system_prompt_any : state.system_prompt;
+    const saved = state[PROMPT_SAVED[which] || PROMPT_SAVED.region];
     $('prompt-text').value = saved || promptDefault(which);
     $('prompt-msg').textContent = saved
       ? '正在编辑你自己的这一份。'

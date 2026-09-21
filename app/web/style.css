@@ -535,6 +535,18 @@ body[data-dock="bottom"] .scroll > * {
   overflow-wrap: anywhere;
 }
 
+/* 卡片底部那一行（v0.30：「查看详情」）。
+   ⚠ 右对齐、不撑满：它是个【次要动作】。撑满的话每张卡看起来都像
+     「解释念完了，该点这个了」—— 而用户多数时候只是想读那句话。
+   ⚠ 也不做成 hover 才出现 —— 这条面板是【常驻在笔记边上】的，
+     鼠标多半不在它上面，藏起来等于没有。 */
+.entry-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 1px;
+}
+
 /* 管线耗时行 */
 .stat {
   font-size: 11px;
@@ -835,3 +847,142 @@ body[data-dock="bottom"] .scroll > * {
   line-height: 1.6;
 }
 .toast span { overflow-wrap: anywhere; }
+
+/* ══════════ 查看详情：多轮对话（v0.30） ══════════
+
+   ⚠ 层级夹在中间：#notice 是 50，#closebox 是 60。
+     对话盖在告知之上（点得到卡片就说明告知已经点掉了），
+     但关窗确认永远在最上面 —— 那个是不可逆动作，不许被任何东西挡住。
+
+   ⚠ 这一整块【不动窗口几何】。它是页面内的 .overlay，和 #closebox 一个套子，
+     一个像素的 SetWindowPos 都不发。理由见 index.html 那段说明。 */
+#detailbox { z-index: 55; padding: 10px; }
+
+.chat {
+  width: 100%;
+  max-width: 330px;
+  /* max-height 而不是 height：内容少的时候（刚开头）不该撑成一整屏空白，
+     内容多的时候靠 chat-body 自己滚。⚠ flex 子项默认 min-height:auto，
+     不加下面那条 min-height:0，chat-body 会被内容顶开、整条溢出卡片。 */
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-card);
+  overflow: hidden;
+}
+
+.chat-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 7px 7px 14px;
+  background: var(--bar);
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .3px;
+}
+
+/* 对话框里那个词。一整句英文术语会很长，必须 anywhere ——
+   否则它会把卡片撑破（知识库那三个按钮犯过同样的错）。 */
+.chat-term {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.chat-term:empty { display: none; }
+
+.chat-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+}
+.chat-body:empty { display: none; }
+
+/* 气泡。
+   ⚠ 区分「你问的」和「AI 答的」靠【底色 + 对齐】，**不靠灰度**：
+     设计规范写死了文字只有黑色，层级只能用字重和字号 ——
+     靠灰字区分角色是这条规范第一个会被人顺手破坏的地方。
+   ⚠ white-space: pre-wrap 是【必须的】：提示词里明令模型只输出纯文本、
+     段落靠空行分。不加这条，模型分好的段会挤成一坨。 */
+.bubble {
+  max-width: 92%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctrl);
+  font-size: 12px;
+  line-height: 1.8;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.bubble-user {
+  align-self: flex-end;
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+.bubble-ai {
+  align-self: flex-start;
+  background: var(--sunken);
+}
+
+/* 「正在问模型…」。★ 它【必须占一个气泡的位置】——
+   不占的话，用户点完发送看到的是一片没变化的对话框，
+   只能靠「发送按钮变灰了」猜出程序收到了，而按钮变灰这件事
+   在截图里看不出来、在 OCR 里也读不出来。 */
+.bubble-wait {
+  align-self: flex-start;
+  background: var(--sunken);
+  animation: wl-pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .bubble-wait { animation: none; }
+}
+
+/* ⚠ 失败【不插气泡】，只写 #chat-msg 那行字，并且把你发出去的那句
+   原样放回输入框。两个理由：
+     1. 后端失败时【没有把这一轮写进会话】，界面上如果冒出一个气泡，
+        屏幕上和会话里就对不上了 —— 下次重开这一段就少一条，看起来像丢消息；
+     2. 放开输入框是为了能重试。一次网络抖动就把用户刚打的一段字吞掉，
+        那是数据丢失，不是「提示一下」。 */
+
+.chat-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 7px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--line);
+}
+
+/* 输入框跟着字长高（app.js 里按 scrollHeight 调 rows），
+   超过 4 行就自己滚 —— 不定高的话，粘一整段进去会把对话框撑到屏幕外。 */
+.chat-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-ctrl);
+  background: var(--sunken);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink);
+  resize: none;
+  overflow-y: auto;
+}
+.chat-input:focus { outline: none; border-color: var(--accent); background: var(--card); }

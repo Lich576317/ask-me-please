@@ -46,6 +46,8 @@ for _s in (sys.stdout, sys.stderr):
 
 ctypes.windll.shcore.SetProcessDpiAwareness(2)   # 探针必须自己 DPI 感知
 
+import win32api                                                   # noqa: E402
+import win32con                                                   # noqa: E402
 import win32gui                                                   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -107,6 +109,7 @@ AI_DELAY = 4.0        # 让「正在问模型」这段停留得够久，能被�
 DONE = [False]        # run()（region 相）
 CLIP_DONE = [False]   # run_clip()（clip 相）
 WL_DONE = [False]     # run_clip_whitelist()（白名单 + 取词 那一相）
+DT_DONE = [False]     # run_detail()（查看详情对话框，v0.30 那一相）
 
 
 def seed_settings(auto_on=False, policy="dedupe"):
@@ -188,9 +191,10 @@ def main():
     #   是靠 RAG 恰好也在【笔记原文】里才继续变绿的，属于为错误的理由通过。
     #   本脚本的主题是 ②，库里该是空的：让 ③ 的命中与否由
     #   `知识库端到端联调.py` 专门去验，别在这里串味。
-    for _p in (KB_DB, KB_DB + "-wal", KB_DB + "-shm"):
-        if os.path.exists(_p):
-            os.remove(_p)
+    #   ⚠ 走 `drop_kb()` 不直接 `os.remove`：这里通常一把就成（开局已经
+    #     `require_clean_screen()` 查过没有别的实例），但 ⑨ 那一相是在
+    #     `taskkill` 之后删的，得重试 —— 同一件事不该有两份写法。
+    drop_kb()
 
     # ⚠ WENLEMA_SETTINGS：和 WENLEMA_KB / WENLEMA_BASE_URL 一个性质 ——
     #   留给联调脚本的接口，不是给用户的开关。有它，app 才不去读
@@ -249,6 +253,18 @@ def main():
             except BOX.ScreenLocked:
                 interrupted = True
                 BOX.lock_bail()
+
+        # ⚠ ⑨ 同样【另起一个干净实例】，理由和 ⑦⑧ 一字不差。
+        #   它还多一条自己的：这一相要在半路【换掉假服务器的回答】
+        #   （卡片那轮回 JSON、详情那轮回大白话），
+        #   而 `AIT.SCEN` 是模块级的 —— 上一个实例还活着的话，
+        #   它下一次请求就会拿到换过的那份。
+        if not interrupted:
+            try:
+                run_detail(port)
+            except BOX.ScreenLocked:
+                interrupted = True
+                BOX.lock_bail()
     finally:
         srv.shutdown()
 
@@ -270,6 +286,8 @@ def main():
             cut = "clip 那一相（run_clip）"
         elif not WL_DONE[0]:
             cut = "白名单那一相（run_clip_whitelist）"
+        elif not DT_DONE[0]:
+            cut = "查看详情那一相（run_detail）"
     if interrupted or cut:
         print("-" * 62)
         print(f"截断了：通过 {BOX._ok} 项，不通过 {BOX._fail} 项，后面的没跑")
@@ -477,14 +495,18 @@ def _run_clip_asserts(app):
     # 用反面的「一段时间内没有截屏」验不出来 —— 那和「自动通道本来就慢」
     # 长得一模一样。这条等得久是有意的，见 CLIP_SETTLE 上面的说明。
     fired = BOX.wait_for(lambda: bool(read_log("[管线] 截屏")), CLIP_SETTLE * 2 + 30)
+    # ⚠ 这段话原来写在 `detail` 里，于是【通过】那一行上也照打 ——
+    #   而它是一句纯粹的失败分诊（「先分清再改代码」），对着一条绿的说
+    #   「去查是哪一种」，读者第一反应是「这条到底过没过」。
+    #   `detail` 两路都打，判据是「这句话在【通过】那行上还成立吗」。
     BOX.check("★ clip 没把这一屏钉成「跑过了」—— 自动通道照样发车",
               fired,
-              "两种可能，先分清再改代码："
-              "① clip 真的上报了 done（本相要防的 bug）；"
-              "② 自动通道本来就没触发 —— 先看标题栏那行字是"
-              "「自动 · Ns」还是「待框选/待确认/截屏失败」，"
-              "接线断没断和画面积不满 N 秒要分开，"
-              "`自动通道端到端联调.py` 的 dump_why_not_fired 就是干这个的")
+              hint="两种可能，先分清再改代码："
+                   "① clip 真的上报了 done（本相要防的 bug）；"
+                   "② 自动通道本来就没触发 —— 先看标题栏那行字是"
+                   "「自动 · Ns」还是「待框选/待确认/截屏失败」，"
+                   "接线断没断和画面积不满 N 秒要分开，"
+                   "`自动通道端到端联调.py` 的 dump_why_not_fired 就是干这个的")
     if not fired:
         _dump_clip(app)
 
@@ -641,6 +663,309 @@ def _dump_clip(app):
         print(f"      （读日志失败：{e!r}）")
 
 
+# ══════════════════════════════════════════════════════════
+# v0.30 · 「查看详情」对话框（详情）那一相
+# ══════════════════════════════════════════════════════════
+#
+# 这一相要钉的是**用户拍板的三条**（2026-09-21），一条都不许松：
+#
+#   1. 「同一个词第二次点详情 —— 这次开着就记住，关程序就忘」
+#      → 判据是【假服务器收到几次请求】。第二次点必须 **0 次新请求**，
+#        而屏幕上照样要有东西（否则「没花钱」和「没反应」长得一模一样）。
+#   2. 「就盖在面板上，不动窗口尺寸」
+#      → 判据是打开前后 `GetWindowRect` **一个像素都不许变**。
+#   3. 「能自由追问（真·聊天）」
+#      → 这一相只验到「重新问能再花一次钱」这一跳；
+#        「追问时带上了上下文」在 `详情联调.py` 的 G 组（函数级，更精确）。
+#        ⚠ **在对话框里打字那一跳没被任何自动化测试覆盖**，如实写在这里：
+#          它要 OCR 认出输入框的占位符才点得中，而占位符是 12px 的一小行 ——
+#          靠它当判据的话，红的时候分不清「产品坏了」还是「OCR 没认出来」。
+#          与其留一条时灵时不灵的断言，不如把这一跳写成「没验」。
+#
+# ⚠ 卡片怎么来的：走 `WENLEMA_CLIP_TEXT` 那条后门（和 ⑦⑧ 同一套），
+#   不点「立即识别」—— 那要示例笔记窗口正好在框选区域里，是本相
+#   不关心的环境依赖。这里要的只是【面板上有一张带按钮的卡】。
+
+# 卡片上那句话（走 ② 的 JSON，和别的相一样）。
+DETAIL_TEXT = "RAG 是先把资料查出来再回答"
+
+DETAIL_ANSWER = {"条目": [
+    {"术语": "RAG", "解释": "假服务器回答：卡片上这句。"},
+]}
+
+# ⚠ 详情那一轮，假服务器回的是【大白话】，不是 JSON ——
+#   `ai.chat` 和 `ai.explain` 是两条路（见 `app/detail.py` 开头）。
+#   所以下面这段要在【卡片已经渲染出来之后】再换上去：
+#   早换的话，卡片那一轮会把这段大白话当 JSON 解析，卡片根本出不来，
+#   而那时红的是「找不到查看详情按钮」，跟真因差着十万八千里。
+DETAIL_CHAT_TEXT = "假服务器回答：这里是【详情对话框】的正文，卡片上没有这句。"
+DETAIL_CHAT_ANCHOR = "详情对话框"
+
+
+def drop_kb(deadline=10.0):
+    """删掉测试知识库（连 `-wal` / `-shm`）。**带重试**，成功返回 True。
+
+    ★ 为什么要重试（2026-09-21 第一次跑 ⑨ 就栽在这上面）：
+      上一相末尾那句 `taskkill /F` **一返回，被杀进程的文件句柄未必
+      已经还给系统**。删早了会拿到
+      `PermissionError: [WinError 32] 另一个程序正在使用此文件` ——
+      而它是一条 traceback，会把整份脚本带走，**后面所有相一项都不跑**。
+      以「删不掉」的样子暴露还算好的；真正坏的是它看起来像产品崩了。
+    """
+    t0 = time.time()
+    while True:
+        try:
+            for p in (KB_DB, KB_DB + "-wal", KB_DB + "-shm"):
+                if os.path.exists(p):
+                    os.remove(p)
+            return True
+        except OSError as e:
+            if time.time() - t0 > deadline:
+                print(f"⚠ 测试库删不掉，等了 {deadline:.0f}s：{e}", flush=True)
+                return False
+            time.sleep(0.3)
+
+
+def run_detail(port):
+    """「查看详情」对话框：点开 → 缓存命中不花钱 → 重新问再花一次。"""
+    print("\n" + "─" * 62)
+    print("⑨ 查看详情对话框（v0.30）—— 另起一个干净实例")
+    print("─" * 62)
+
+    if not BOX.require_clean_screen():
+        return
+
+    seed_settings(auto_on=False)
+    open(APPLOG, "wb").close()
+
+    # ★ 这一相要一张【真的由 ② 解出来的】卡，所以测试库必须是干净的。
+    #   ⚠ 不删的话：上一相（白名单）刚往同一个测试库里塞了 3 条，而本相的
+    #     选段里正好有 `RAG` —— dedupe 会直接贴库里的解释、**根本不调 ②**。
+    #     于是「刚才花了一次钱」那几条断言的基准全错，请求数一次都不涨，
+    #     而卡片照样画得出来、屏幕上看不出任何异常。
+    #   ⚠ 这条删不掉时【必须停下】而不是接着跑：接着跑的每一句都在量
+    #     一张没花钱的卡，红的会是「恰好花了一次钱」，而那是错误的原因。
+    if not BOX.check("★ 测试库已清空（否则本相量的是知识库、不是详情）",
+                     drop_kb(),
+                     hint="多半还有上一个实例活着：先确认没有别的「问了吗」在跑"):
+        return
+
+    AIT.SCEN.update(status=200,
+                    content=json.dumps(DETAIL_ANSWER, ensure_ascii=False),
+                    delay=1.0)
+    AIT.GOT.update(hits=0, last=None, auth=None)
+
+    env = dict(os.environ,
+               WENLEMA_BASE_URL=f"http://127.0.0.1:{port}",
+               WENLEMA_KB=KB_DB,
+               WENLEMA_SETTINGS=SETTINGS,
+               WENLEMA_CLIP_TEXT=DETAIL_TEXT)
+    log = open(APPLOG, "wb")
+    app = subprocess.Popen([sys.executable, "main.py"], cwd=APP, env=env,
+                           stdout=log, stderr=subprocess.STDOUT)
+    try:
+        _run_detail_asserts(app)
+    finally:
+        subprocess.run(["taskkill", "/PID", str(app.pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _detail_report(i=0):
+    """读第 i 条（从 0 数）`[前端] 详情:` 上报，解析成 dict。读不到 → None。
+
+    ★ 为什么要这条通道（`api().report`）而不是 OCR 找那句答：
+      它报的是**结构**（几条消息、什么角色、是不是缓存命中），
+      而 `renderChat()` 是先写完 `#chat-body` 再上报的 —— 所以
+      「收到这条」= 「DOM 真的被写过了」。模型答的**正文**是不可信输入，
+      不该拿去当判据。
+    """
+    lines = read_log("[前端] 详情: ")
+    if i >= len(lines):
+        return None
+    raw = lines[i].split("[前端] 详情: ", 1)[1]
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _close_dialog(panel):
+    """把对话框收起来。
+
+    ⚠ 两个动作**都做**，因为它们各自都可能不生效，而且都是幂等的：
+      · 点背景（`.chat` 之外那片）—— 前端 `#detailbox` 的 click 处理器
+        只在 `e.target` 就是背景层时才关，所以落点必须在 `.chat` 外面。
+        `.chat` 宽 330 CSS（面板内容区几乎占满），所以取**面板左下角**，
+        那里一定在对话框外面（`.chat` 是居中的）。
+      · 再补一下 Esc —— 前端把 Esc 也绑在「关掉对话框」上。
+    少一个的话，某次「没关掉」会让**下一条断言**顶着
+    「第二次点还在花钱」的名字红，而真因是对话框压根没关、那一下点在了框里。
+    """
+    r = win32gui.GetWindowRect(panel)
+    BOX.click((r[0] + 8, r[3] - 25))
+    BOX.activate(panel)
+    win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
+    time.sleep(0.05)
+    win32api.keybd_event(win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0)
+    time.sleep(0.5)
+
+
+def _run_detail_asserts(app):
+    t0 = time.time()
+    got = BOX.wait_for(lambda: bool(read_log("[管线·取词]")), 40)
+    if not BOX.check("★ 前置：卡片那一轮跑完了（否则本相无从谈起）",
+                     got, f"等了 {time.time() - t0:.1f}s"):
+        _dump_clip(app)
+        return
+
+    # ⚠ 等【卡片渲染出来】再换假服务器的回答。判据是 ② 那行日志 ——
+    #   它出现 = 结果已经回到前端了。早换的话见 DETAIL_CHAT_TEXT 上面那段。
+    BOX.wait_for(lambda: bool(read_log("[AI] ")), 30)
+
+    panel = BOX.find_window(BOX.PANEL_TITLE, app.pid)
+    if not BOX.check("拿到主窗口句柄（详情那一相）", bool(panel)):
+        _dump_clip(app)
+        return
+    BOX.wait_laid_out_or_warn(app.pid, APPLOG)
+    r = win32gui.GetWindowRect(panel)
+    origin = (r[0], r[1])
+    panel_rect = (r[0], r[1], r[2] - r[0], r[3] - r[1])
+
+    # ⚠ 要的是【坐标】不是「在不在」—— 下面 `click_until` 拿它去 SetCursorPos，
+    #   给个 bool 会当场 TypeError，而那是 traceback，整份脚本从这一行就没了。
+    btn = point_on_panel(panel_rect, origin, "查看详情")
+    if not BOX.check("★ 卡片上有「查看详情」这个按钮（用户要的那个入口）",
+                     bool(btn),
+                     hint="卡片渲染出来了却没有这个按钮 = 入口没了；"
+                          "整块都没有的话先看上面那条卡片断言"):
+        _dump_clip(app)
+        return
+
+    # ── 现在才换假服务器的回答：详情那一轮要回一段【大白话】 ──────
+    AIT.SCEN.update(content=DETAIL_CHAT_TEXT, delay=1.0)
+    hits0 = AIT.GOT.get("hits", 0)
+    rect_before = win32gui.GetWindowRect(panel)
+
+    # ── ① 点开：一次请求、内容上屏 ─────────────────────────────
+    n = BOX.click_until(panel, btn,
+                        lambda: BOX.wait_for(lambda: bool(_detail_report(0)), 10),
+                        "查看详情")
+    # ⚠ `click_until` 点满次数全落空时返回 0 而且一个字都不打 ——
+    #   调用方必须把它收下来，否则「点了 4 次没落进 WebView」
+    #   和「一把点中」在日志里长得一模一样。
+    # ⚠ `detail` 两路都打（`框选联调.check`），所以只写中性事实：
+    #   `n=0` 自己要能读出来（`click_until` 全落空就是返回 0，且一个字不打）。
+    #   「一次都没来」只有失败那侧才成立，它属于 `hint`。
+    if not BOX.check("★ 「查看详情」真的点进去了（上报来了）", bool(n),
+                     f"click_until 返回 {n}",
+                     hint="`[前端] 详情:` 一次都没来（`click_until` 返回 0 = 一次都没落进 WebView）。"
+                          "先看 app 日志里有没有 `[AI·详情]`："
+                          "有 = 请求到了后端，问题在前端渲染；"
+                          "一行都没有 = 点击没送到（前台焦点/锁屏）"):
+        _dump_clip(app)
+        return
+
+    rep = _detail_report(0) or {}
+    BOX.check("★ 点开之后对话框里是【两轮】：我那句 + 它那答",
+              rep.get("roles") == "ua" and rep.get("n") == 2, f"上报的是 {rep!r}")
+    BOX.check("★ 第一次是【真问模型】（不是缓存）", rep.get("cached") is False,
+              f"上报的是 {rep!r}")
+    BOX.check("★ 恰好花了一次钱（点开这一跳只发一次请求）",
+              AIT.GOT.get("hits", 0) == hits0 + 1,
+              f"点开前 {hits0} 次、点开后 {AIT.GOT.get('hits', 0)} 次")
+
+    # ── ② 对话框真的画在【面板上】 ──────────────────────────────
+    # 「重新问」和占位符只属于对话框 —— 卡片上没有这两个词。
+    BOX.check("★ 对话框是画在面板上的（屏幕上找得到「重新问」）",
+              find_on_panel(panel_rect, origin, "重新问"),
+              hint="找不到 = 对话框没渲染，或者它开到别的窗口里去了")
+    # ★ 这句是【对话框独有的正文】—— 卡片上那句是另一段（见 DETAIL_CHAT_TEXT）。
+    #   所以它上屏证明的是「详情那一轮的答案真的走到了屏幕上」，
+    #   而不是「卡片底下那句话被 OCR 又读了一遍」。
+    BOX.check("★ 详情那一轮的答案真的上了对话框（不是卡片底下那句）",
+              find_on_panel(panel_rect, origin, DETAIL_CHAT_ANCHOR),
+              hint="对话框里找得到「详情对话框」几个字才算数")
+
+    # ── ③ ★★ 窗口几何一个像素都不许动 ──────────────────────────
+    # 用户 2026-09-21 拍板：「就盖在面板上，不动窗口尺寸」。
+    # 面板是一条 520 物理像素的窄栏，改几何去腾地方的话，
+    # 用户桌面上那一条会跟着挪 —— 而他在飞书里正干着活。
+    rect_after = win32gui.GetWindowRect(panel)
+    BOX.check("★★ 打开对话框【没有动过窗口尺寸/位置】",
+              rect_after == rect_before,
+              f"开之前 {rect_before}、开之后 {rect_after}",
+              hint="差一个像素都不行：这条是用户拍板时明说的那一条")
+
+    # ── ④ ★★ 第二次点同一个词：0 次新请求 ──────────────────────
+    # 用户 2026-09-21 拍板：「这次开着就记住，关程序就忘」。
+    # ⚠ 判据是【两条一起】：上报必须来（证明点真的落进了那个按钮），
+    #   而请求数不许涨（证明没有重新花钱）。
+    #   只判「请求数没涨」的话，点空了也照样绿 —— 那是为错误的理由通过。
+    hits1 = AIT.GOT.get("hits", 0)
+    _close_dialog(panel)
+    # ★ 先确认它【真的关掉了】再点。判据是「重新问」从屏幕上消失了 ——
+    #   它是对话框独有的词，卡片上没有。
+    #   ⚠ 这一步不是多余的谨慎：没关掉的话，下面那一下会落在对话框里，
+    #     而紧接着红的会是「第二次点还在花钱」——**原因完全是错的**，
+    #     而且它会把人引去查缓存那段代码。
+    #   ⚠ `notches=0` = 【不滚】。下面那一下要回到存下来的 `btn` 坐标去点，
+    #     而滚动会改变面板的滚动位置 —— 内容一动，那个坐标就不再是那个按钮了。
+    #     对话框是盖在面板上的浮层、不需要滚就看得见，所以不滚也找得到它。
+    still = find_on_panel(panel_rect, origin, "重新问", tries=2, notches=0)
+    if not BOX.check("★ 对话框真的关掉了（「重新问」不在屏幕上了）", not still,
+                     hint="没关掉的话，下一次点击会落在对话框里，"
+                          "后面红的每一条原因都是错的"):
+        _dump_clip(app)
+        return
+    # ⚠ 位置用【存下来的那个点】，不重新 OCR：对话框标题也叫「查看详情」，
+    #   万一它没关掉，OCR 找到的是标题（同一串字），点上去什么都不会发生 ——
+    #   而那会变成一条绿色的假通过。上面那条断言就是这个的保险。
+    n = BOX.click_until(panel, btn,
+                        lambda: BOX.wait_for(lambda: bool(_detail_report(1)), 10),
+                        "查看详情（第二次）")
+    if not BOX.check("★ 第二次点也真的落进去了（上报来了）", bool(n),
+                     f"click_until 返回 {n}",
+                     hint="第二条上报没来（返回 0 = 一次都没落进 WebView）。"
+                          "多半是对话框没关掉，这一下点在了对话框里"):
+        _dump_clip(app)
+        return
+
+    rep2 = _detail_report(1) or {}
+    BOX.check("★★ 第二次点【没有】重新问模型（用户拍板：这次开着就记住）",
+              AIT.GOT.get("hits", 0) == hits1,
+              f"第二次点之前 {hits1} 次、之后 {AIT.GOT.get('hits', 0)} 次",
+              hint="涨了就是每次点都白花一次钱 —— 功能看着好好的，用户看不出来")
+    BOX.check("★★ 第二次点屏幕上照样有内容（不是「没花钱也没东西」）",
+              rep2.get("cached") is True and rep2.get("n") == 2,
+              f"上报的是 {rep2!r}")
+
+    # ── ⑤ 「重新问」真的再花一次钱 ─────────────────────────────
+    again = point_on_panel(panel_rect, origin, "重新问")   # ← 同上：要坐标
+    if not BOX.check("★ 找得到「重新问」按钮", bool(again),
+                     hint="它是用户唯一的出路 —— 模型第一次答跑偏了，"
+                          "没它这条会话就钉死在这一版答案上"):
+        _dump_clip(app)
+        return
+    hits2 = AIT.GOT.get("hits", 0)
+    n = BOX.click_until(panel, again,
+                        lambda: BOX.wait_for(lambda: bool(_detail_report(2)), 10),
+                        "重新问")
+    if not BOX.check("★ 「重新问」点进去了（第三条上报来了）", bool(n),
+                     f"点了 {n} 次"):
+        _dump_clip(app)
+        return
+    rep3 = _detail_report(2) or {}
+    BOX.check("★ 「重新问」真的重新问了一次模型（这一下是该花钱的）",
+              AIT.GOT.get("hits", 0) == hits2 + 1 and rep3.get("cached") is False,
+              f"点之前 {hits2} 次、之后 {AIT.GOT.get('hits', 0)} 次，"
+              f"上报 {rep3!r}")
+    BOX.check("★ 重问之后还是个两轮的新会话（旧的那条真的丢了）",
+              rep3.get("n") == 2 and rep3.get("roles") == "ua",
+              f"上报的是 {rep3!r}")
+
+    DT_DONE[0] = True       # ← 跑到这里这一相才算【整相跑完】。见 main()。
+
+
 def find_on_panel(panel_rect, origin, needle, tries=9, notches=-4):
     """在面板上找 needle —— 一屏找不到就往下滚一点再找。
 
@@ -654,17 +979,33 @@ def find_on_panel(panel_rect, origin, needle, tries=9, notches=-4):
     ⚠ 只往下滚：调用它的顺序必须和卡片在流里的顺序一致（上面的先找）。
       一次滚 4 格 ≈ 12 行，远小于面板高度，不会一步跨过整张卡。
     """
+    return bool(point_on_panel(panel_rect, origin, needle, tries, notches))
+
+
+def point_on_panel(panel_rect, origin, needle, tries=9, notches=-4):
+    """在面板上找 needle，**返回它的屏幕坐标**；找不到返回 None。
+
+    ⚠ 和 `find_on_panel` 是同一件事的两种返回：那个只回答「在不在」，
+      这个还得能点。**滚动逻辑只能有一份** —— 各写一遍的话，
+      「找得到」和「点得中」迟早会指到两个不同的地方，
+      而那种分叉不报错，只是点了个空。
+
+    ⚠ `notches=0` = **不滚**。要断言「屏幕上还有没有这个东西」时用它：
+      滚动会改变面板的滚动位置，而后面若还要回到某个存下来的坐标去点，
+      那一下就可能落在别的卡片上（面板内容一动，坐标就不再是那个坐标了）。
+    """
     shot = os.path.join(HERE, "_ai_panel_result.png")
     cx = panel_rect[0] + panel_rect[2] // 2
     cy = panel_rect[1] + panel_rect[3] // 2
     for i in range(tries):
         BOX.grab(panel_rect, shot)
-        if BOX.ocr_find(shot, needle, origin):
-            return True
-        if i < tries - 1:
+        pos = BOX.ocr_find(shot, needle, origin)
+        if pos:
+            return pos
+        if i < tries - 1 and notches:
             BOX.wheel((cx, cy), notches)
             time.sleep(0.4)
-    return False
+    return None
 
 
 def run(app):

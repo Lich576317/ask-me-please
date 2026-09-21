@@ -27,6 +27,16 @@ app/settings.json
 app/settings.json.tmp
 app/kb.db*
 app/web/_shot.png
+# ⚠ 2026-09-21 补。`_region.png`（`main.SHOT_REGION`）是【待识别那一块】——
+#   框选底图里裁下来的用户笔记正文。它和 `_shot.png` 是同一类东西，
+#   但只有 `_shot.png` 被写进了这份清单，`_region.png` 漏了。
+#   正常情况下 `_clear_shots()` 开机删一次、退出前再删一次，盘上不该有它；
+#   可 `os._exit(0)` 跳过一切 finally，被强杀 / 覆盖层没收干净时它就会留下 ——
+#   而 `git status` 里一个 `?? app/_region.png` 看着像构建产物，
+#   不像「用户的笔记正文躺在仓库里」。
+#   ★ 这条是 2026-09-21 加 v0.30.0 时【真的撞见】才补的：跑完联调，
+#     盘上就搁着这么一个文件，而 `git add -A` 本来会把它一起提交。
+app/_region.png
 
 # ── 二、用户的截图（可能含笔记内容，决策 33）─────────────────
 ocr测试/screenshot-*.png
