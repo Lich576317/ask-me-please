@@ -50,6 +50,10 @@ for _p in (KB_DB, KB_DB + "-wal", KB_DB + "-shm"):
 import requests                                                  # noqa: E402
 import ai                                                        # noqa: E402
 
+# 「出口自检」那把共用的尺子（见 `尺子.py`）。
+sys.path.insert(0, HERE)
+import 尺子                                                       # noqa: E402
+
 
 # ══════════════════════════════════════════════════════════
 # 假 DeepSeek
@@ -561,6 +565,13 @@ def t_clip_channel():
 # ══════════════════════════════════════════════════════════
 
 def main():
+    # ★ 先验尺子：本文件的 `check()` 是它全部 78 项断言的唯一出口，
+    #   它坏成「无条件记通过」的话 78 项一起变绿，项数对账还照样通过。
+    # ⚠️ 摆在起假服务器【之前】，也摆在任何 try 之外 ——
+    #   尺子坏了就别开服务器了，跑出来的数没有意义。
+    if not 尺子.gate(check, *尺子.list_snapshot(PASS, FAIL), label="AI接入联调"):
+        return 2
+
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
     srv.daemon_threads = True
     port = srv.server_address[1]

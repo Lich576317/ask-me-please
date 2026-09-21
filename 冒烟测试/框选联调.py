@@ -982,6 +982,200 @@ def t_drag_guard():
         win32api.mouse_event = real_evt
 
 
+def t_click_until_unit():
+    """★ `click_until()` 「点满 tries 次全落空」那条路，真的跑一遍。
+
+    ⚠️ 为什么它需要补（2026-09-21）：
+      `click_until` 只有在点了 N 次都没生效时才返回 0 —— 而回归里一直是点中的，
+      所以**这条路径从写下来到今天一次都没执行过**。
+      调用方那十条现在都收了这个 0（当天逐条核过），
+      但「0 这条路本身」**没有任何一条断言钉过**：
+      一个永远返回 1 的 `click_until`，和一个真的点中了，在日志里长得一模一样。
+
+    ⚠️ 不碰一个像素：把模块级的 `activate` / `click` 换成桩。
+      被测的本来就是**这段循环**（重试几次、什么时候停、返回什么），
+      不是 Win32 点击 —— 真去点的话，这条单元测试会去点用户当时的屏幕，
+      而它还排在 ⓪ 段（窗口都没开）。
+
+    ★ 三条都要，缺一条就挡不住一种坏法：
+      · 返回 0 —— 挡「永远返回 1」
+      · 点了 3 次 —— 挡「返回 0 但其实一次都没点」（空转通过和通过长得一样）
+      · 反向 一次就成返回 1 —— 挡「无条件返回 0」这个反方向的坏
+    """
+    g = globals()
+    real_activate, real_click = g["activate"], g["click"]
+    n = {"activate": 0, "click": 0}
+
+    def bump(k):
+        def f(_):
+            n[k] += 1
+        return f
+
+    try:
+        g["activate"] = bump("activate")
+        g["click"] = bump("click")
+
+        # ── ① 三次全落空 → 返回 0 ──────────────────────────
+        n.update(activate=0, click=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = click_until(0, (0, 0), lambda: False, "假按钮", tries=3, wait=0.01)
+        check("★ click_until 点满 tries 次全落空 → 返回 0（这条路径从没执行过）",
+              r == 0, f"返回了 {r!r}",
+              hint="调用方那句 `if not n:` 就靠这个 0 才发现点击没送到")
+        check("★ click_until 返回 0 之前，真的试满了 3 次（不是提前放弃）",
+              n["click"] == 3, f"click 被调了 {n['click']} 次",
+              hint="返回 0 但一次都没点 = 空转通过，和真的点满了长得一样")
+        check("click_until 每次重试都重新激活窗口（不是只激活一次）",
+              n["activate"] == 3, f"activate 被调了 {n['activate']} 次",
+              hint="『第一次点击被 Windows 吃掉』就是靠每轮重新 activate 治的")
+
+        # ── ② 反向对照：一次就成 → 返回 1，且只点一次 ──────
+        n.update(activate=0, click=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = click_until(0, (0, 0), lambda: True, "假按钮", tries=3, wait=0.01)
+        check("click_until 反向对照：第一次就生效 → 返回 1、且只点一次",
+              r == 1 and n["click"] == 1, f"返回 {r!r}，click {n['click']} 次")
+
+        # ── ③ 第三次才成 → 返回的是【第几次】，不是布尔 ────
+        n.update(activate=0, click=0)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r = click_until(0, (0, 0), lambda: n["click"] >= 3, "假按钮",
+                            tries=4, wait=0.01)
+        check("★ click_until 第 3 次才生效 → 返回的是【第几次】(3)，不是布尔",
+              r == 3, f"返回了 {r!r}",
+              hint="返回 True/False 的话，『点到第几次才成』这个信息就丢了")
+        check("click_until 补点成功时，会把「点到第几次才生效」打出来",
+              "第 3 次" in buf.getvalue(), f"输出 {buf.getvalue().strip()[:100]!r}")
+    finally:
+        g["activate"] = real_activate
+        g["click"] = real_click
+
+
+def t_stray_guard():
+    """★ `stray_panels()` / `require_clean_screen()` 这道守卫，真的拦一次人。
+
+    ⚠️ 为什么它需要补（2026-09-21）：
+      `require_clean_screen()` 从写下来到今天**只返回过 True** ——
+      也就是说「屏幕上已经有另一个『问了吗』」那条路，
+      它存在的**唯一理由**，一次都没走过。
+      一个永远返回 True 的守卫，和一个真的查过、屏幕确实很干净的守卫，
+      在日志里长得一模一样（本项目老账：「恒绿的记分卡是装饰品」）。
+
+    ⚠️ 造条件的办法：起一个**标题就是「问了吗」**的真窗口。
+      它是真窗口、真的可见、真的会被 `EnumWindows` 枚举到 ——
+      走的是产品自己那条判据（标题相等 **且** 可见），一个字都没 mock。
+      （同 `t_drag_guard` 的思路：拿真条件逼出那条分支，而不是假装跑过了。）
+
+    ⚠️ 无论成不成，finally 里都要把这个进程杀掉、并**等它真的消失**再交卷 ——
+      留一个标题叫「问了吗」的窗口在屏幕上，后面每一步都会读到它。
+    """
+    # 兜底自杀：万一 kill 没送到，它 30 秒后自己消失，不会赖在屏幕上。
+    DECOY = (
+        "import sys, tkinter as tk\n"
+        "r = tk.Tk()\n"
+        "r.title(sys.argv[1])\n"
+        "r.geometry('260x160+60+60')\n"
+        "r.after(30000, r.destroy)\n"
+        "r.mainloop()\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", DECOY, PANEL_TITLE],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline and not stray_panels():
+            time.sleep(0.2)
+
+        hits = stray_panels()
+        check("★ 屏幕上摆一个标题是「问了吗」的窗口 → stray_panels() 看得见它",
+              bool(hits), f"扫到 {len(hits)} 个",
+              hint="一个都没找到 —— 这道守卫的判据够不着真实窗口")
+        check("stray_panels() 把 pid 一起报出来（不然不知道该杀哪个）",
+              bool(hits) and all(isinstance(p, int) and p > 0 for _, p in hits),
+              f"实到 {hits!r}")
+
+        # ★★ 这条就是「从没执行过」的那一条。
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            clean = require_clean_screen(timeout=0.4)
+        out = buf.getvalue()
+        check("★★ require_clean_screen 有别的实例时【返回 False】（从没执行过）",
+              clean is False, f"返回了 {clean!r}",
+              hint="它从写下来到现在只返回过 True —— 那条路等于没验过")
+        check("★ 它还把「怎么关掉它」打出来了（taskkill 那行）",
+              "taskkill" in out, f"输出 {out.strip()[:120]!r}",
+              hint="只说「不干净」不说怎么办，用户就只能自己猜")
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        deadline = time.time() + 5
+        while time.time() < deadline and stray_panels():
+            time.sleep(0.2)
+
+
+def t_lock_signal_unit():
+    """★ `screen_locked()` 的【判据那一半】真的会说 True。
+
+    ⚠️ 这条要**拆成两半**看，别把一半说成两半（本项目老账：
+      「检查的覆盖面 < 结论的覆盖面」—— 只核了 A 却打出涵盖 A 和 B 的结论）：
+
+        (a)【判据那一半】`fg_exe()` 说是 lockapp.exe 时，`screen_locked()` 返回 True。
+            ✅ 不需要锁屏，把 `fg_exe` 换成桩就行。**就是下面这段。**
+        (b)【信号那一半】真锁屏的时候，`fg_exe()` 到底会不会说 "lockapp.exe"。
+            ❌ **必须真去锁一次屏**，自动化做不到。
+               `冒烟测试\\验锁屏判据.py` 就是干这个的 —— **要用户本人跑**
+               （它会把他的屏幕锁上）。那份脚本跑之前也先做了正向对照
+               （没锁时必须说 False），理由同一个。
+
+    ★ 拆开的价值很具体：一个「永远返回 False」的 `screen_locked()` 有两种坏法 ——
+      判据写错了（这段能抓），或者**输入信号本身不对**（这段抓不到，(b) 才抓得到）。
+      把 (a) 钉住之后，(b) 真出问题时只剩一种可能，不用再从两头猜。
+
+    ⚠️ 为什么它需要补：`screen_locked()` 从写下来到今天**一次都没返回过 True**。
+      而它是**所有开窗脚本的第一道门** —— 它恒假的话，锁屏跑回归不会被拦，
+      会以「面板上没有这几个字」这类指错方向的理由红一屏（真踩过，白查了一轮）。
+    """
+    g = globals()
+    real = g["fg_exe"]
+    try:
+        # ① 判据说「前台是锁屏程序」→ 必须 True
+        g["fg_exe"] = lambda: "lockapp.exe"
+        check("★ fg_exe() 报 lockapp.exe 时 screen_locked() 是 True（从没返回过 True）",
+              screen_locked() is True, f"返回了 {screen_locked()!r}",
+              hint="判据恒假 = 这道门等于不存在，锁屏跑回归不会被拦")
+
+        # ② 反向对照：判据说「前台是桌面」→ 必须 False。
+        #    没有它的话，一个「无条件返回 True」的 screen_locked() 也拿满分 ——
+        #    而那会把【没锁屏】的正常回归全都拦下来（另一个方向的灾难）。
+        g["fg_exe"] = lambda: "explorer.exe"
+        check("★ screen_locked() 反向对照：前台是桌面时说 False（不是恒真）",
+              screen_locked() is False, f"返回了 {screen_locked()!r}",
+              hint="恒真的话，正常跑回归会被自己的开局自查拦下")
+
+        # ③ 第一道门真的会拦人
+        g["fg_exe"] = lambda: "lockapp.exe"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok = require_unlocked()
+        check("★★ require_unlocked() 在锁屏信号下返回 False（第一道门真的会拦）",
+              ok is False, f"返回了 {ok!r}",
+              hint="门恒开着的话，锁屏那份会一路跑下去、红一屏假失败")
+        # ⚠️ 下面这条的 detail 会把那句「屏幕现在是【锁着的】」**原文抄进日志**。
+        #    这本身是对的 —— detail 就该显示用户真会看到的话。
+        #    但要知道：**这是那句话的第二个来源**（第一个是真的锁屏）。
+        #    2026-09-21 就是它把 `全部回归.py` 骗了：一份 38 项全绿的报告
+        #    被记成「锁屏，整段没跑」，还被排除在合计之外。
+        #    修在读的那一头（`全部回归.finished_normally()`：跑完的脚本
+        #    一定有正常汇总行，靠【结构】判，不靠措辞）。**这条断言不用改。**
+        check("★ 它把「先解锁再跑」说出来了（不是只拒绝、不说下一步）",
+              "解锁" in buf.getvalue(), f"输出 {buf.getvalue().strip()[:90]!r}")
+    finally:
+        g["fg_exe"] = real
+
+
 def main():
     print("=" * 62)
     print("问了吗 · 框选 + 识别 联调")
@@ -999,9 +1193,18 @@ def main():
     #   摆在最前面，才不会因为它们排在谁后面而跟着一起不跑。
     #   ⚠ 也【不能】摆到 `require_clean_screen()` 前面：那样锁屏时它们会跑，
     #     而 `全部回归.py` 对锁屏那一种报的是「整段没跑」—— 报的就不是实话了。
-    print("\n⓪ 两条从没执行过的分支（不需要窗口，先跑掉）")
+    print("\n⓪ 从没执行过的分支（先跑掉）")
     t_confirm_lock()
     t_drag_guard()
+    # ⚠️ 这两条都要排在 `require_clean_screen()` 【之后】——
+    #    `t_stray_guard` 会**故意**摆一个不干净的屏幕出来，
+    #    摆在开局自查前面的话，那份自查就永远是红的了。
+    t_click_until_unit()
+    t_stray_guard()
+    # ⚠️ 这条**只验了判据那一半**（把 `fg_exe` 换成桩）。
+    #    「真锁屏时 fg_exe() 会不会说 lockapp.exe」那一半必须用户本人跑
+    #    `验锁屏判据.py` —— 见那个函数自己的说明。
+    t_lock_signal_unit()
 
     open(SAMPLE, "w", encoding="utf-8").write(NOTE_TEXT)
     reset_region()

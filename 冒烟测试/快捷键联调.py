@@ -53,6 +53,10 @@ for _s in (sys.stdout, sys.stderr):
 
 import hotkey as hk                                                # noqa: E402
 
+# 「出口自检」那把共用的尺子（见 `尺子.py`）。
+sys.path.insert(0, HERE)
+import 尺子                                                       # noqa: E402
+
 try:
     import win32clipboard as wc
     import win32con
@@ -87,20 +91,13 @@ def skip(name, why):
     print(f"  [没测] {name}　→ {why}")
 
 
-def guard():
-    """守门员：先确认 check() 真的会把假断言记成失败。
-
-    ⚠️ **不能写在 try 里。** 这个项目已经栽过一次：守门断言和被守的代码
-      套在同一个 try 里，前者抛异常时后者跟着缺席，而汇总照样打绿的。
-    """
-    before_f, before_p = len(FAIL), len(PASS)
-    check("守门员（这一条是【故意】为假的，不该出现在汇总里）", False,
-          "故意的")
-    caught = len(FAIL) == before_f + 1 and len(PASS) == before_p
-    if FAIL:
-        FAIL.pop()                      # 把它撤掉，别污染汇总
-    print(f"  [守门] 假的断言会被记成失败：{'是' if caught else '否 —— 汇总不可信！'}")
-    return caught
+# ⚠️ 这里原来有个 `guard()`，只探【一个方向】（假断言记不记失败）。
+#    2026-09-21 换成 `尺子.gate()`，那个是**两个方向**都探的
+#    （真断言记不记通过、假断言记不记失败），而且和另外三份脚本
+#    共用同一份实现 —— 免得这里又长成「第五种写法」。
+#    老守门员那条规矩照旧，别丢：**不能写在 try 里。** 这个项目栽过一次 ——
+#    守门断言和被守的代码套在同一个 try 里，前者抛异常时后者跟着缺席，
+#    而汇总照样打绿的。
 
 
 # ══════════════════════════════════════════════════════════
@@ -354,9 +351,11 @@ def main():
     if not hk.AVAILABLE:
         print(f"⚠ 热键不可用（{hk.IMPORT_ERR}）—— 下面的取词用例会跳过。")
 
-    if not guard():
-        print("\n❌ 守门员没过：这个脚本的 check() 记不住失败，汇总不可信。")
-        return 1
+    # ★ 先验尺子：`check()` 是这 50 项断言的唯一出口，它坏成
+    #   「无条件记通过」的话 50 项一起变绿，而项数对账还照样通过。
+    # ⚠️ 摆在任何 try 之外（老守门员那条规矩）。
+    if not 尺子.gate(check, *尺子.list_snapshot(PASS, FAIL), label="快捷键联调"):
+        return 2
 
     t_combo()
     t_gate()

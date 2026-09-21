@@ -63,9 +63,17 @@ SCRIPTS = [
     ("AI接入联调.py",       78, False),
     ("自动通道联调.py",     49, False),
     ("快捷键联调.py",       50, False),
+    # 2026-09-21 新增。纯内存 + 一个临时 settings 文件，不开窗口。
+    # ⚠️ 它 `import main`（DPAPI 那对函数住在 main 里），但把
+    #    `WENLEMA_SETTINGS` 指到 `_密钥联调_settings.json` ——
+    #    **不碰用户真的那份**（脚本里 C.2 自己核一遍这件事）。
+    ("密钥落盘联调.py",     33, False),
     ("知识库端到端联调.py", 69, True),
     ("AI端到端联调.py",     32, True),
-    ("框选联调.py",         24, True),
+    # 24 → 38：2026-09-21 补了三条「从没执行过的分支」
+    # （`click_until` 的返回 0 那条路、`stray_panels` 真的拦到人那次、
+    #   `screen_locked()` 判据那一半真的会说 True）。
+    ("框选联调.py",         38, True),
     # 排最后：它自己会起一个「示例笔记」陪练窗口，并改写联调那份 settings
     # （`_e2e_settings.json`，不是用户真的那份）。放在其他开窗脚本前面的话，
     # 后面那些脚本会吃到它留下的区域设置。
@@ -101,6 +109,19 @@ SUMMARY = re.compile(
 #   项数对账都由别的判据算，看不看明细都不改变 ✅ 还是 ❌。
 #   `全部回归.selfcheck()` 的 ⑤ 钉的就是这三种前缀都认得出来。
 DETAIL = re.compile(r"^\s*\[(?:不通过|失败|!!)\]\s*(.*)$")
+
+# 出口自检那道闸门打的标记（`框选联调.gate_check_selftest()` / `尺子.gate()`）。
+#
+# ★ 为什么「有闸门」不够、还要专门认这一行：
+#   八份脚本每份都有一个 `check()`，而**它自己也可能是坏的**
+#   （最凶的一种坏法是「无条件记通过」—— 那会让通过数正好等于期望，
+#    项数对账照样通过，一屏全绿一个字都不报错）。
+#   2026-09-21 给八份都配了自检闸门。但**闸门写了却没被调用**，
+#   和「闸门跑了而且通过」在日志上长得一模一样 ——
+#   于是「检查的覆盖面」又小于「结论的覆盖面」。
+#   所以这里要求：**跑过的脚本，日志里必须有这一行。**
+#   ⚠️ 只对【真跑过】的脚本要求；锁屏那种整段没跑的，不要求。
+GATE_MARK = "check() 自检通过"
 
 KEEP_RUNS = 5      # 只留最近 N 轮，别把磁盘堆满
 
@@ -218,6 +239,31 @@ def parse_fails(text):
             for l in text.splitlines() if DETAIL.match(l)]
 
 
+def finished_normally(text):
+    """这份日志是不是【跑到了自己的结论】。→ True/False
+
+    ★★ 为什么需要这个、而不是只看 `LOCKED in text`：
+       `LOCKED` 是【一句给人看的话】，而**一句话可以被断言引用**。
+       2026-09-21 真踩到：`框选联调.py` 为「三条从没红过的判据」补了一条
+       `t_lock_signal_unit()` —— 它故意把 `fg_exe` 换成桩，好让
+       `require_unlocked()` 真的返回一次 False。于是那句警告**被真的打了出来**，
+       回归读到它，把一份 **38 项全绿、跑完整整五节**的报告记成
+       「锁屏，整段没跑」并排除在合计之外。日志一个字没错，判定错了。
+
+    ★ 正确的判据是【结构】不是【措辞】：跑完的脚本一定会打一行正常汇总；
+      开局锁屏的不会打任何汇总；跑到一半的只打那句「截断了：…」。
+       而「这份日志里到底有没有一个正常汇总行」是伪造不出来的 ——
+       断言可以引用一句话，但它不能凭空让脚本宣布自己跑完了。
+
+    ⚠️ `TRUNCATED not in text` 这一半不能省：那句「截断了：通过 2 项，
+       不通过 0 项，后面的没跑」**是能被 `SUMMARY` 正则匹配上的**，
+       所以「找到了汇总行」在截断的那一种里也是 True。少了这一半，
+       跑到一半锁屏会被记成「跑完了」—— 方向正好是更糟的那一边。
+    """
+    _ok, _bad, _skip_n, found = parse_summary(text)
+    return found and TRUNCATED not in text
+
+
 def classify(windowed, text, skip_n=0):
     """这个脚本是【怎么没跑完】的。空串 = 它跑完了。
 
@@ -226,8 +272,13 @@ def classify(windowed, text, skip_n=0):
       这段文案）。不加限定就会把「跑完了」错判成「锁屏」，方向是
       **把绿的报成没跑** —— 而反向的错（把没跑的报成绿）更糟，
       所以两种都不敢赌，这里只认确凿的那一种。
+
+    ⚠️ `finished_normally()` 那个条件同样不能省，而且它是**两个条件里更硬的那个**：
+       `windowed` 挡的是「别的类别的脚本引用了这句话」，
+       它挡的是「**同一份脚本里、一条断言故意把锁屏这条路走了一遍**」。
+       后者才是 2026-09-21 那次的实际形态（见 `finished_normally` 的说明）。
     """
-    if windowed and LOCKED in text:
+    if windowed and LOCKED in text and not finished_normally(text):
         return "cut" if TRUNCATED in text else "locked"
     if NOCLIP in text:
         return "noclip"
@@ -385,7 +436,8 @@ def main(scripts=None, script_dir=None, logroot=None, app_dir=None,
         ok, bad, skip_n, found = parse_summary(text)
         fails = parse_fails(text)
         skip = classify(windowed, text, skip_n)
-        rows.append((name, ok, bad, expect, secs, log, fails, skip, skip_n))
+        gated = GATE_MARK in text
+        rows.append((name, ok, bad, expect, secs, log, fails, skip, skip_n, gated))
 
         if skip == "noclip":
             # ⚠ 和锁屏那两种【不是一个形态】，所以【不能】跟着 continue ——
@@ -416,7 +468,7 @@ def main(scripts=None, script_dir=None, logroot=None, app_dir=None,
     total_ok = total_bad = 0
     problems = []
     skipped = []
-    for name, ok, bad, expect, secs, log, fails, skip, skip_n in rows:
+    for name, ok, bad, expect, secs, log, fails, skip, skip_n, gated in rows:
         if skip:
             skipped.append(name)
             print("  " + skip_note(name, ok, expect, secs, skip, skip_n))
@@ -426,7 +478,14 @@ def main(scripts=None, script_dir=None, logroot=None, app_dir=None,
         mark, note, is_problem = judge(ok, bad, expect)
         if is_problem:
             problems.append(name)
-        print(f"  {mark} {name:<22} 通过 {ok:>3}　不通过 {max(bad,0)}{note}")
+        # ★ 闸门【跑过没有】，和闸门【说没说通过】是两件事。
+        #   ⚠️ 只对真跑过的脚本要求（锁屏那种整段没跑的在上面 continue 掉了）。
+        if not gated:
+            is_problem = True
+            problems.append(f"{name}（出口自检没跑）")
+            note += "　⚠ 日志里没有出口自检那行 —— 这份的 check() 没被验过"
+        print(f"  {mark} {name:<22} 通过 {ok:>3}　不通过 {max(bad,0)}"
+              f"　出口自检{'✓' if gated else '✗'}{note}")
     print(f"\n  合计：通过 {total_ok} 项，不通过 {total_bad} 项")
 
     # ── 数据安全 ────────────────────────────────────────
@@ -489,15 +548,26 @@ def main(scripts=None, script_dir=None, logroot=None, app_dir=None,
 #   汇总行**一个字都认不出来** → 每个假脚本都被判成「没找到汇总行」。
 #   ★ 我第一遍就是这么写的，22 条里错了 14 条，连「一路顺风」那组都红 ——
 #     而根因不是判断逻辑，是夹具。**夹具错了会伪装成产品错了。**
-PRE = ("import sys\n"
-       "for _s in (sys.stdout, sys.stderr):\n"
-       "    try:\n"
-       "        _s.reconfigure(encoding='utf-8', errors='replace')\n"
-       "    except Exception:\n"
-       "        pass\n")
+# 仿造脚本的「前置段」拆成两半，是为了 ⑨ 那条用例：
+# 它要试的是「闸门那行没有」—— 但编码那五行**不能一起去掉**，
+# 去掉的话仿造脚本按 GBK 写出、汇总行一个字都认不出，
+# 于是红的会是「没找到汇总行」而不是「闸门没跑」——
+# **试错东西了，而屏幕上两条都写着「红了」。**
+PRE_ENC = ("import sys\n"
+           "for _s in (sys.stdout, sys.stderr):\n"
+           "    try:\n"
+           "        _s.reconfigure(encoding='utf-8', errors='replace')\n"
+           "    except Exception:\n"
+           "        pass\n")
+
+# ★ 仿造脚本也要打那句闸门标记 —— 真的八份脚本每份都有。
+#   ⚠️ 少这一行的话，「闸门没跑要报错」那条规则会把下面
+#      **每一条**仿造用例都判红，包括「一路顺风」那组，
+#      而红的原因跟被测的判断逻辑毫无关系 —— 又是夹具的错。
+PRE = PRE_ENC + "print('  ✓ check() 自检通过（仿造脚本）')\n"
 
 
-def _drive(tmp, tag, scripts, files, pre=None):
+def _drive(tmp, tag, scripts, files, pre=None, prelude=None):
     """把整个 `main()` 拿【仿造脚本】跑一遍，返回 (打出来的字, 退出码)。
 
     files: {脚本名: 源码}；源码里的 `@APP@` 会换成这次用的临时 app 目录 ——
@@ -517,7 +587,8 @@ def _drive(tmp, tag, scripts, files, pre=None):
         os.makedirs(d, exist_ok=True)
     for name, src in files.items():
         with open(os.path.join(sdir, name), "w", encoding="utf-8") as f:
-            f.write(PRE + src.replace("@APP@", app))
+            f.write((PRE if prelude is None else prelude)
+                    + src.replace("@APP@", app))
     for fname, body in (pre or {}).items():
         with open(os.path.join(app, fname), "w", encoding="utf-8") as f:
             f.write(body)
@@ -595,10 +666,20 @@ def selfcheck():
             want(f"⑤ 明细：`[{tag}]` 时退出码非 0", rc != 0, f"rc={rc}")
 
         # ⑥ 没跑完的三种形态 —— 措辞必须分开，混成一句就是撒谎
+        #
+        # ⚠️ 这个夹具【故意不打汇总行】，而且这是它跟真实行为对齐的关键：
+        #    四个开窗脚本开局锁屏时都是 `require_clean_screen()` 返回 False
+        #    之后【立刻 return，一行汇总都不打】——
+        #    逐个核过：框选联调.py:1176 / 知识库端到端联调.py:749 /
+        #    AI端到端联调.py:154 / 自动通道端到端联调.py:501，全是 `return 1`。
+        #    原来这里写的是 `LOCK + green(0)`，等于给一份「锁屏退出」的运行
+        #    配了一行「通过 0 项」——**它模仿的系统不那样运行**。
+        #    2026-09-21 修 `finished_normally()` 时这两条当场红了，
+        #    红得对：该改的是夹具，不是判据（断言一个字没动）。
         LOCK = "print('屏幕现在是【锁着的】')\n"
         out, _ = _drive(tmp, "lock", [("己.py", 5, True)],
-                        {"己.py": LOCK + green(0)})
-        want("⑥ 开局锁屏 →「锁屏，整段没跑」", "锁屏，整段没跑" in out)
+                        {"己.py": LOCK})
+        want("⑥ 开局锁屏（无汇总行）→「锁屏，整段没跑」", "锁屏，整段没跑" in out)
         want("⑥ 开局锁屏 → 不许说「全绿」", "✅ 全绿。" not in out)
 
         out, _ = _drive(tmp, "cut", [("庚.py", 5, True)],
@@ -613,6 +694,23 @@ def selfcheck():
                                    "屏幕现在是【锁着的】）')\n" + green(1)})
         want("⑥ 纯内存脚本里出现同一句话 → 不许判成锁屏",
              "锁屏，整段没跑" not in out and rc == 0, f"rc={rc}")
+
+        # ★★ 开窗脚本【跑完了】，但日志里出现了那句话 —— 2026-09-21 真踩到的一次。
+        #    背景：`框选联调.py` 为「三条从没红过的判据」补了一条
+        #    `t_lock_signal_unit()`，它故意把 `fg_exe` 换成桩，
+        #    好让 `require_unlocked()` 真的返回一次 False ——
+        #    于是那句警告**被真真切切打进了日志**。
+        #    当时回归把一份 **38 项全绿、五节都跑完**的报告记成
+        #    「锁屏，整段没跑」，还把它排除在合计之外：报出来的总数
+        #    比真跑过的少 38。**这不是错报，是漏报** —— 而漏报特别难发现，
+        #    因为它长得就像「这一份今天没轮上跑」。
+        #    ⚠️ 上面那条 ⑥ 挡不住它：那条试的是【别的类别的脚本】引用这句话，
+        #       这条试的是【同一份开窗脚本里】一条断言走了锁屏那条路。
+        out, rc = _drive(tmp, "fakelock_done", [("壬.py", 5, True)],
+                         {"壬.py": LOCK + green(5)})
+        want("⑥ 开窗脚本【跑完了】但日志里有那句话 → 不许判成锁屏",
+             "锁屏，整段没跑" not in out and "跑到一半锁了" not in out, f"out={out[-120:]!r}")
+        want("⑥ …而且照常算通过（退出码 0）", rc == 0, f"rc={rc}")
 
         # ⑦ 两条数据安全网 —— 2026-09-15 就是在这一处一边报 ✓ 一边弄丢 Key
         #    两个替身【开跑前就摆好】，假脚本再去动它们。
@@ -651,13 +749,35 @@ def selfcheck():
         #    安全网【整段一次都没跑】—— 因为它被摆在 `return 1` 后面。
         #    报告长得和「该核的都核了」一模一样。
         #    这一条就是钉调用点的：谁再把 `data_safety` 往下挪，它就红。
+        #
+        # ⚠️ 这里的夹具同样【不打汇总行】—— 理由和第 ⑥ 组那两条一样：
+        #    原来的 `+ green(0)` 让这份假脚本「先跑完、再宣布自己锁屏了」，
+        #    而那正是 2026-09-21 那个缺陷的形状，不是真实脚本的行为。
+        #    去掉之后它才真是一份「开局锁屏、整段没跑」的运行 ——
+        #    也就是这条断言本来要试的那个东西。
         out, rc = _drive(tmp, "safe_when_skipped", [("寅.py", 5, True)],
                          {"寅.py": MUT + LOCK
-                          + "open(p,'w').write('sk-test-fake')\n" + green(0)},
+                          + "open(p,'w').write('sk-test-fake')\n"},
                          pre=PRE_APP)
         want("⑧ ★ 没跑完的那一轮，安全网【照样要跑】",
              "锁屏，整段没跑" in out
              and "⚠⚠ 真实 settings.json 被改动了" in out, f"rc={rc}")
+
+        # ⑨ ★ 出口自检那道闸门【跑过没有】。
+        #    2026-09-21 给八份脚本都配了闸门 —— 但「闸门写了却没被调用」
+        #    和「闸门跑了而且通过」在日志上长得一模一样。
+        #    ⚠️ 这条必须配一个「没有那行就红」的反向用例，
+        #      否则它只是个装饰：一份**没打那行**的日志照样能全绿。
+        out, rc = _drive(tmp, "gate_on", [("卯.py", 3, False)],
+                         {"卯.py": green(3)})       # PRE 里有那行
+        want("⑨ 闸门跑了 → 该全绿", "✅ 全绿。" in out and rc == 0, f"rc={rc}")
+
+        out, rc = _drive(tmp, "gate_off", [("卯.py", 3, False)],
+                         {"卯.py": green(3)}, prelude=PRE_ENC)
+        want("⑨ ★ 闸门【没跑】→ 必须报出来，不许全绿",
+             "✅ 全绿。" not in out and "出口自检没跑" in out
+             and "出口自检✗" in out, f"rc={rc}")
+        want("⑨ ★ 闸门没跑 → 退出码非 0", rc != 0, f"rc={rc}")
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -668,8 +788,9 @@ def selfcheck():
         print("   在那之前，它报的「全绿」不作数。")
     else:
         print(f"✅ {_n[0]}/{_n[0]} 条全对：三种措辞、项数对账、跳过三分类、"
-              "明细行、两条安全网，")
-        print("   以及「没跑完那一轮安全网照样跑」—— 都验过了。")
+              "明细行、两条安全网、")
+        print("   「没跑完那一轮安全网照样跑」、「闸门没跑要报出来」"
+              "—— 都验过了。")
     return 1 if _n[1] else 0
 
 

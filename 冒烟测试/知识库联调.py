@@ -36,6 +36,12 @@ for _s in (sys.stdout, sys.stderr):
 import kb                                                        # noqa: E402
 import pipeline                                                  # noqa: E402
 
+# 「出口自检」那把共用的尺子（见 `尺子.py`）。
+# ⚠ HERE 得自己插进 sys.path —— 本文件被 `importlib` 装载时
+#   （`验工具自检.py` 就是这么干的）sys.path[0] 不一定是这儿。
+sys.path.insert(0, HERE)
+import 尺子                                                       # noqa: E402
+
 PASS, FAIL = [], []
 _TMPDIRS = []
 
@@ -599,6 +605,14 @@ def main():
     print("═" * 52)
     print("③ 知识库联调")
     print("═" * 52)
+
+    # ★ 先验尺子。本文件的 `check()` 是它全部 80 项断言的唯一出口 ——
+    #   它要是坏成了「无条件记通过」，80 项会一起变绿，**而且项数对账
+    #   照样通过**（实到 80 = 期望 80）。这是本项目唯一一种
+    #   「没有任何别的机制兜得住」的坏法。
+    # ⚠️ 摆在 try 之外 —— 守门的东西不能和被守的代码套在同一个 try 里。
+    if not 尺子.gate(check, *尺子.list_snapshot(PASS, FAIL), label="知识库联调"):
+        return 2
 
     try:
         for fn in (t_canon, t_policies, t_excluded, t_seam, t_attach,

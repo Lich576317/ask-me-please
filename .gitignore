@@ -20,6 +20,11 @@
 # app/kb.db*        = 用户的知识库（连 -wal / -shm 一起）
 # app/web/_shot.png = 框选底图 = 用户【整个桌面】的截图（决策 33）
 app/settings.json
+# ⚠ `save_settings()` 走 `.tmp` + `os.replace()` 原子替换（那把 Key 只有一份，
+#   不能写到一半）。正常情况下跑完就没了，但**万一它留下了**，
+#   里面装的正是 settings.json 的全部内容 —— 包括那把 Key。
+#   漏了这一行的话，一个 `.tmp` 残留就能被 `git add .` 提交上去。
+app/settings.json.tmp
 app/kb.db*
 app/web/_shot.png
 

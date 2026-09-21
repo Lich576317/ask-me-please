@@ -38,6 +38,7 @@ import kb                                                        # noqa: E402
 import ocr                                                       # noqa: E402
 import pipeline                                                  # noqa: E402
 import prompt as prompt_mod                                      # noqa: E402
+import secret                                                    # noqa: E402
 import shell as shell_mod                                        # noqa: E402
 from shell import Shell, TITLE, PANEL_W                          # noqa: E402
 
@@ -128,15 +129,71 @@ def load_settings():
             data = json.load(f)
         merged = dict(DEFAULT_SETTINGS)
         merged.update(data)
-        return merged, False
     except Exception:
+        # ⚠️ 整个文件读不出来（不存在 / 不是 JSON）才算「从头来过」。
+        #    ★ 一把 Key 解不开**不归这里管** —— 见下面。这两件事原来混在
+        #      同一个 try 里，于是「Key 解不开」会被吞成「整份设置读不出来
+        #      → 全用默认值」：用户会连框选区域、知识库策略、快捷键一起丢，
+        #      而且不知道为什么。**「读不出来」不该长得像「本来就没有」。**
         return dict(DEFAULT_SETTINGS), True
+
+    # ══════════ API Key：单独处理，四个状态都要说清 ══════════
+    # （落盘格式与状态语义的唯一真相来源是 `app/secret.py` 的文件头。）
+    raw_key = merged.get("api_key") or ""
+    key, status = secret.unseal(raw_key)
+    merged["api_key"] = key
+
+    if status == "bad":
+        # ⚠️ **这里必须出声。** 悄悄给一个空 Key 的话，用户看到的是
+        #    「Key 没填」，而真正的原因是「换了机器/用户，解不开了」——
+        #    两件事的下一步动作完全不同（一个是去填，一个是去重填）。
+        print("[设置] ⚠ 存着的那把 API Key 【解不开】了 —— 它只在这台机器、"
+              "这个 Windows 用户下能用。请在操作台重新填一次。", flush=True)
+    elif status == "plain" and key:
+        # ★ 老格式（明文）→ 加载时就地迁移成密文。
+        #   不做这一步的话，用户盘上那份明文会**永远**躺着不动 ——
+        #   他没有理由再去动一次 Key，也就永远等不到第一次 save。
+        # ⚠️ 迁移的安全性靠两件事，都在 `secret.seal()` / `save_settings()` 里：
+        #    (1) seal() 加完密**当场读回来**，读不回来就宁可存明文；
+        #    (2) 存盘走 `.tmp` + `os.replace()`，**原子**替换 ——
+        #        直接开原文件覆盖写，写到一半断电 = 那把唯一的 Key 没了。
+        try:
+            save_settings(merged)
+            print("[设置] API Key 已从【明文】就地改成 DPAPI 密文"
+                  "（原来的明文已被覆盖）", flush=True)
+        except Exception as e:
+            print(f"[设置] ⚠ 想把明文改成密文但没成功，文件里还是明文："
+                  f"{type(e).__name__}", flush=True)
+
+    return merged, False
 
 
 def save_settings(data):
-    """⚠ 目前是明文 JSON。API Key 存储方式仍是待定事项（进展文档 六-4）。"""
-    with open(settings_path(), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """存盘。**API Key 在这里变成密文**（DPAPI，见 `app/secret.py`）。
+
+    ⚠️ 两条不许动的：
+      1. **Key 必须先过 `secret.seal()`**。`seal()` 自己会验一遍能不能读回来，
+         验不过就返回明文 —— 宁可明文也不要写一个解不开的串。
+         判据是 `secret.is_encrypted(返回值)`，所以这里能看出降级了没有。
+      2. **走 `.tmp` + `os.replace()`，不直接覆盖**。这个文件里有这个项目
+         唯一一份「丢了就没了」的数据（用户的 API Key），
+         直接覆盖写 = 写到一半出任何事都是永久损失。
+    """
+    path = settings_path()
+    payload = dict(data)
+    plain = (data.get("api_key") or "").strip()
+    payload["api_key"] = secret.seal(plain)
+    if plain and not secret.is_encrypted(payload["api_key"]):
+        # 只在这把 Key **真的没被加密**时才出声 —— 不打字的话，
+        # 「落盘是明文」这件事没有任何人会发现（同 `secret.seal` 的说明）。
+        print("[设置] ⚠ 这把 API Key 只能以【明文】落盘（DPAPI 不可用）——"
+              "换机器或换 Windows 用户时它反而能跟着走，但这台机器上"
+              "任何能读这个文件的程序都读得到它。", flush=True)
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)          # 原子：要么旧的、要么新的，没有中间态
 
 
 class Api:

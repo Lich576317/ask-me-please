@@ -42,6 +42,10 @@ sys.path.insert(0, APP)
 
 import auto                                                       # noqa: E402
 
+# 「出口自检」那把共用的尺子（见 `尺子.py`）。
+sys.path.insert(0, HERE)
+import 尺子                                                       # noqa: E402
+
 W, H = 64, 64                     # 假画面尺寸，够大能体现比例，够小跑得快
 FRAME_LEN = W * H * 3
 
@@ -422,10 +426,28 @@ def test_cost():
           auto.looks_changed(s, s[:10]) is True)
 
 
+def _snap():
+    """给尺子看的快照 —— 本文件的计数器是【两个整数】，不是列表。
+    ★ 这正是 `尺子.gate()` 收 `snapshot`/`restore` 而不是直接收列表的原因：
+      它不该认识任何一种写法，否则它自己就成了「第五种写法」。"""
+    return _ok, _fail
+
+
+def _restore(v):
+    global _ok, _fail
+    _ok, _fail = v
+
+
 def main():
     print("=" * 62)
     print("问了吗 · 自动通道 联调（判决逻辑层，不碰屏幕）")
     print("=" * 62)
+
+    # ★ 先验尺子：`check()` 是这 49 项断言的唯一出口，
+    #   它坏成「无条件记通过」的话 49 项一起变绿，项数对账还照样通过。
+    # ⚠️ 摆在任何 try 之外，也摆在第一批断言之前。
+    if not 尺子.gate(check, _snap, _restore, label="自动通道联调"):
+        return 2
 
     test_tolerance()
     test_fire_once()
