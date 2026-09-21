@@ -91,8 +91,25 @@ FAKE_ANSWER = {"条目": [
 
 AI_DELAY = 4.0        # 让「正在问模型」这段停留得够久，能被稳定截到
 
+# ── 两相各自跑完了没有 ────────────────────────────────────
+# ⚠ `run()` / `run_clip()` 里每个 `if not BOX.check(...): return` 都是【静默交卷】：
+#   一个字不打就把控制权还回去，而 main() 照样打「通过 N 项，不通过 M 项」——
+#   读起来就是一份跑完的报告。
+#
+#   ★ 这不是假想的：`知识库端到端联调.py` 的 ⑧ 里就有一句这种 return，
+#     v0.20 的回归里它把后面 45 项整段跳过，脚本报的是「通过 24 项，不通过 4 项」。
+#     抓出它的是 `全部回归.py` 的期望项数对账，不是脚本自己。
+#
+#   ★ 本文件 main() 里也早写了「截断的一份报成『通过 N 项』就是在撒谎」，
+#     但当时只防住了【锁屏】那一种 ——「没跑完」跟它是因为什么停的无关。
+#
+#   所以两相各留一面旗子，main() 收齐了才敢打汇总行。
+DONE = [False]        # run()（region 相）
+CLIP_DONE = [False]   # run_clip()（clip 相）
+WL_DONE = [False]     # run_clip_whitelist()（白名单 + 取词 那一相）
 
-def seed_settings(auto_on=False):
+
+def seed_settings(auto_on=False, policy="dedupe"):
     """种一份「装好就能跑」的联调 settings：已有区域、已有（假）Key。
 
     ⚠ 种的是 `_e2e_settings.json`，不是 `app\\settings.json` —— 整份重写，
@@ -102,12 +119,14 @@ def seed_settings(auto_on=False):
 
     `auto_on` 只有快捷键那一相（`run_clip()`）会传 True：那里要靠
       「自动通道还发不发车」来验「clip 没有把这一屏钉成【跑过了】」。
+
+    `policy` 只有白名单那一相（`run_clip_whitelist()`）会传 "whitelist"。
     """
     note = BOX.NOTE_RECT
     with open(SETTINGS, "w", encoding="utf-8") as f:
         json.dump({
             "api_key": "sk-test-fake",        # 假的。真 Key 由用户自己填
-            "kb_policy": "dedupe",
+            "kb_policy": policy,
             "kb_dir": "",
             "system_prompt": "",              # 空 = 用后端默认提示词
             "seen_notice": True,              # 别让首用告知盖住界面
@@ -216,15 +235,43 @@ def main():
             except BOX.ScreenLocked:
                 interrupted = True
                 BOX.lock_bail()
+
+        # ⚠ ⑧ 同样【另起一个干净实例】，理由和 ⑦ 一字不差
+        #   （日志只能有一个作者 + 上一相的卡片会干扰 OCR）。
+        #   它还多一条自己的：这一相要换 `kb_policy`，而策略是启动时读进
+        #   `self.settings` 的 —— 在同一个实例里改文件，进程里那份不会变。
+        if not interrupted:
+            try:
+                run_clip_whitelist(port)
+            except BOX.ScreenLocked:
+                interrupted = True
+                BOX.lock_bail()
     finally:
         srv.shutdown()
 
-    if interrupted:
-        # ⚠ 不能照常打汇总行、更不能返回 0 —— 整份是【截断的】。
-        #   截断的一份报成「通过 N 项」就是在撒谎，而且是把
-        #   「没验过」和「验过了没问题」说成同一个样子。
+    # ⚠ 不能照常打汇总行、更不能返回 0 —— 整份是【截断的】。
+    #   截断的一份报成「通过 N 项」就是在撒谎，而且是把
+    #   「没验过」和「验过了没问题」说成同一个样子。
+    #
+    # ⚠ 「截断」跟它是【因为什么】停的无关。锁屏是一种（interrupted），
+    #   两个 run 里那些提前 return 是另一种（旗子没置上）。
+    #   从前只防住了锁屏那一种 —— 于是一相半路停了，报告照样是完整的。
+    #   ⚠ 锁屏那一支不算在内：那时候旗子同样是 False，但停下来的原因
+    #     已经由 `BOX.lock_bail()` 说清楚了，再补一句「是那句 if return 的」
+    #     就是在给一个对的现象配一个错的原因。
+    cut = None
+    if not interrupted:
+        if not DONE[0]:
+            cut = "region 那一相（run）"
+        elif not CLIP_DONE[0]:
+            cut = "clip 那一相（run_clip）"
+        elif not WL_DONE[0]:
+            cut = "白名单那一相（run_clip_whitelist）"
+    if interrupted or cut:
         print("-" * 62)
         print(f"截断了：通过 {BOX._ok} 项，不通过 {BOX._fail} 项，后面的没跑")
+        if cut:
+            print(f"       停在{cut} —— 是那句 if 没通过就 return 了，不是跑完了。")
         return 1
 
     print("-" * 62)
@@ -308,8 +355,8 @@ def _run_clip_asserts(app):
     got = BOX.wait_for(lambda: bool(read_log("[管线·取词]")), 40)
     if not BOX.check("★ 前端轮询取走了选段并跑完了 clip 管线"
                      "（日志里有 `[管线·取词]`）", got,
-                     "没有它 = 后端种下的选段从没被前端取走，"
-                     "或者前端那条 clip 分支没跑起来"):
+                     hint="40 秒都没等到 = 后端种下的选段从没被前端取走，"
+                          "或者前端那条 clip 分支没跑起来"):
         _dump_clip(app)
         return
 
@@ -329,6 +376,43 @@ def _run_clip_asserts(app):
               "有 `[管线] 截屏` 就说明 clip 那条也去截屏了 —— 它不该截屏")
 
     # ── ② 真的被调了，而且用的是中英不限那份提示词 ──────────────
+    # ⚠★ 这里【必须】先等 ② 打过来，不能拿上面那句 wait_for 当已经等到了。
+    #   上面等的是【①】的那行日志（`[管线·取词]`），而下面三条判据要的是
+    #   【②】的结果，中间还隔着：① 返回 → 前端重绘 → 前端调 explain →
+    #   后端组 prompt → HTTP 打到假服务器。这几百毫秒里 `hits` 还是 0、
+    #   `last` 还是 None —— 不等就断言，读到的是**那个窗口还没关上**的现场。
+    #
+    #   ★ 2026-09-21 的回归正是这么红的（就这三条），而同一天更早的一次
+    #     回归、**同一个 clip 相、同一份代码**是绿的：
+    #       0921-001225　假服务器收到 1 次请求　→ 三条全绿
+    #       0921-002531　假服务器收到 0 次请求　→ 三条全红
+    #     同一段里更靠后的「★ 中文术语『抓手』一路走到了屏幕上」两次都是绿的 ——
+    #     而它要求 ② 真的返回过 CLIP_ANSWER。**② 明明跑到了，只是跑得比断言晚。**
+    #     两次同码不同果 = 竞态，不是回归。
+    #
+    #   ★ 这条 wait 不会把「真没调」放过去：它有超时，不来的话 30 秒后
+    #     这三条照样红，只是那时「假服务器收到 0 次请求」是一句真话。
+    #     先分清「真没调」和「还没调完」再改代码 —— 修法完全不同。
+    #
+    #   ⚠ 等的是 `hits` 本身，不是照抄 region 那一相去等 `[AI]` 日志行：
+    #     等的判据和断言的判据得是【同一件事】，否则「等到了」和「通过了」
+    #     可能各说各话（等 `[AI]` 是更晚的事件，等回来了也不能保证
+    #     `AIT.GOT['last']` 有内容 —— 那是 HTTP 层记的，跟 app 日志不是一个作者）。
+    t_req = time.time()
+    got = BOX.wait_for(lambda: AIT.GOT.get("hits", 0) >= 1, 30)
+    # ★ 把这个差距量出来打一行。它是「竞态」这个诊断的证据 ——
+    #   不量的话，「② 是后来才到的」永远只是我的一句话。
+    #   有了它，下一次谁再看到下面三条红，日志里就写着到底差了多少。
+    #
+    # ⚠⚠ 只在【真的等到了】的时候打这句（2026-09-21 变体实测出来的）：
+    #   等待超时的那一刻，`time.time() - t_req` 就是整个等待上限（实测打出
+    #   「之后 30.05s」），而这句文案说的是「这几百毫秒」。也就是说 ——
+    #   恰恰在人最需要它解释「为什么红了」的时候，它在撒谎。
+    #   等到了才叫「② 来晚了」；没等到就没有「晚了多少」这回事。
+    if got and time.time() - t_req > 0.05:
+        print(f"       （② 是在 ① 的日志出现【之后 {time.time() - t_req:.2f}s】"
+              f"才打到假服务器的 —— 就是这段时间差会让下面三条一起红）")
+
     req = AIT.GOT.get("last") or {}
     msgs = req.get("messages") or []
     sys_prompt = msgs[0].get("content", "") if msgs else ""
@@ -336,19 +420,26 @@ def _run_clip_asserts(app):
 
     BOX.check("★ 纯中文、① 一个候选都没有，② 还是被调了（没被早退挡住）",
               AIT.GOT.get("hits", 0) >= 1,
-              f"假服务器收到 {AIT.GOT.get('hits', 0)} 次请求")
+              f"假服务器收到 {AIT.GOT.get('hits', 0)} 次请求",
+              hint="等了 30 秒还是 0 次 = 真的没调，不是没调完")
     BOX.check("★ clip 那条日志明说了「无规则候选，交给模型挑」",
               bool(read_log("无规则候选")),
-              "这句是 clip 故意绕过空候选闸门的现场记录，"
-              "没有它就只能靠猜「到底走没走那条岔路」")
+              hint="这句是 clip 故意绕过空候选闸门的现场记录，"
+                   "没有它就只能靠猜「到底走没走那条岔路」")
 
     import prompt as prompt_mod                                   # noqa: E402
+    # ⚠ 两条的 detail 都要把【实际读到的东西】打出来。2026-09-21 那一次，
+    #   这两条的 detail 一个是一句放之四海皆准的解释（「用了英文那份的话…」），
+    #   一个是**空字符串**（`user_msg[:100]`，而 user_msg 本身是空的）——
+    #   红是红了，但看着像「提示词选错了」，跟真因（还没打过来）一点关系没有。
+    #   判据错了可以改判据，判据的【输出】不说是怎么回事，就只能重跑一遍。
     BOX.check("clip 用的是【中英不限】那份提示词",
               sys_prompt == prompt_mod.DEFAULT_PROMPT_ANY,
-              "用了英文那份的话，模型会拒答中文")
+              f"实际开头：{sys_prompt[:60]!r}　"
+              f"（用成英文那份的话，模型会拒答中文）")
     BOX.check("★ clip 的 user message 头是「术语候选词」，不是「英文候选词」",
               "【规则初筛捞出的术语候选词】" in user_msg,
-              user_msg[:100])
+              user_msg[:100] or "（user message 是空的 —— ② 压根没打过来）")
 
     # ★ 中文术语【不在候选表里】—— 它靠的就是 extras 那条通道上屏
     #   （v0.10 决策 47 留下的、唯一不依赖候选表的卡片来源）。
@@ -356,13 +447,22 @@ def _run_clip_asserts(app):
     if not BOX.check("拿到主窗口句柄（clip 那一相）", bool(panel)):
         _dump_clip(app)
         return
+    # ★ 量几何之前先等 app 自己说「摆好了」（L.11 ③.2）。
+    #   pywebview 先建窗口再回调 on_ready，窗口期里量到的是初始值。
+    #   日志必须是【这一相自己那份】—— APPLOG 每相开跑前都被清过一次，
+    #   所以这里读到的「已就位」只可能是本相这个实例打的。
+    BOX.wait_laid_out_or_warn(app.pid, APPLOG)
     r = win32gui.GetWindowRect(panel)
     origin = (r[0], r[1])
     panel_rect = (r[0], r[1], r[2] - r[0], r[3] - r[1])
+    # ⚠ 这句解释【只在失败时才成立】，所以必须走 hint ——
+    #   写在 detail 里的话，通过那一行会变成
+    #   「[通过] ★ 中文术语「抓手」一路走到了屏幕上…　上不了屏说明 extras 分支没接住…」，
+    #   读者看到的是「通过 + 一句说它没做到的话」。
     BOX.check("★ 中文术语「抓手」一路走到了屏幕上（走了 extras 那条通道）",
               find_on_panel(panel_rect, origin, "抓手"),
-              "上不了屏说明 extras 分支没接住不在候选表里的条目 —— "
-              "而 clip 这条通道【所有】中文条目都是那种条目")
+              hint="上不了屏说明 extras 分支没接住不在候选表里的条目 —— "
+                   "而 clip 这条通道【所有】中文条目都是那种条目")
 
     # ── ★ clip 不许上报 done ────────────────────────────────────
     # `auto.report('done')` 有两个副作用：清 busy，**和把「这一屏跑过了」钉上**。
@@ -384,6 +484,143 @@ def _run_clip_asserts(app):
               "`自动通道端到端联调.py` 的 dump_why_not_fired 就是干这个的")
     if not fired:
         _dump_clip(app)
+
+    CLIP_DONE[0] = True     # ← 跑到这里 clip 那一相才算【整相跑完】。见 main()。
+
+
+# ══════════════════════════════════════════════════════════
+# v0.20 补 · 白名单模式 + 取词（决策 52）
+# ══════════════════════════════════════════════════════════
+
+# 选段里【故意】放了一个库里已经有的词（`抓手`）。
+# 这样这一相证明的就不是「库里没有这个词」，而是一件更强的事：
+# **词就在库里，界面上照样什么都不会出现** —— 因为白名单要的是
+# 「① 的候选表里有它」，而 ①（只认英文字母的规则初筛）对中文给不出候选。
+# 这是这条通道【结构上】的限制，不是这一次运气不好。文案必须说清这一点，
+# 否则用户会以为换个词、或者多试几次就能行。
+WL_TEXT = "这个季度的核心抓手是把用户留存的颗粒度对齐到周。"
+
+
+def seed_kb_for_whitelist():
+    """往测试库里塞一个中文词。
+
+    ⚠ 非塞不可：`main.Api._recognize_locked` 里还有一道更早的闸门 ——
+      「白名单 + **空库**」直接返回「知识库还是空的…」，压根走不到
+      本相要验的那道（explain 里的空候选闸门）。库空着的话，
+      这一相绿也是它绿的、红也是它红的，跟被测代码没关系。
+    """
+    os.environ["WENLEMA_KB"] = KB_DB          # 必须在 import kb 之前
+    os.environ.setdefault("WENLEMA_SETTINGS", SETTINGS)
+    import kb as kb_mod                                       # noqa: E402
+    kb_mod.record_entries([{"term": "抓手", "key": kb_mod.canon("抓手"),
+                            "explanation": "（联调塞的）"}], "dedupe")
+    n = kb_mod.stats()["terms"]
+    kb_mod.close()
+    return n
+
+
+def run_clip_whitelist(port):
+    """白名单模式 + 快捷键取词：产品必须【守住自己写的那条规矩】。
+
+    ⚠ 这一相防的不是「功能少了」，是**产品当着用户的面破掉自己的说明**：
+      设置页写着「只解释库内 —— 不在库里的词一概不显示」，而 clip 的中文路径
+      靠 ② 从原文里挑，挑出来的必然不在库里。放它过去的话，用户先是看到
+      「白名单模式：没有知识库收录的词」，紧接着一堆库外的卡片画出来。
+    """
+    print("\n" + "─" * 62)
+    print("⑧ 白名单模式 + 取词 —— 规则要守得住（决策 52）")
+    print("─" * 62)
+    print(f"    （注入的选段：{WL_TEXT}）")
+
+    if not BOX.require_clean_screen():
+        return
+
+    n = seed_kb_for_whitelist()
+    print(f"    （测试库里先塞了 {n} 条 —— 为的是别撞上「白名单 + 空库」那道更早的闸门）")
+    BOX.check("★ 前置：测试库不是空的（否则本相验的是另一道闸门）", n > 0, f"库里 {n} 条")
+    if n <= 0:
+        return
+
+    seed_settings(auto_on=False, policy="whitelist")
+    open(APPLOG, "wb").close()
+
+    AIT.SCEN.update(status=200,
+                    content=json.dumps(CLIP_ANSWER, ensure_ascii=False),
+                    delay=1.0)
+    AIT.GOT.update(hits=0, last=None, auth=None)
+
+    env = dict(os.environ,
+               WENLEMA_BASE_URL=f"http://127.0.0.1:{port}",
+               WENLEMA_KB=KB_DB,
+               WENLEMA_SETTINGS=SETTINGS,
+               WENLEMA_CLIP_TEXT=WL_TEXT)
+    log = open(APPLOG, "wb")
+    app = subprocess.Popen([sys.executable, "main.py"], cwd=APP, env=env,
+                           stdout=log, stderr=subprocess.STDOUT)
+    try:
+        _run_whitelist_asserts(app)
+    finally:
+        subprocess.run(["taskkill", "/PID", str(app.pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _run_whitelist_asserts(app):
+    _t = time.time()
+    got = BOX.wait_for(lambda: bool(read_log("[管线·取词]")), 40)
+    if not BOX.check("★ 前端取走了选段、① 也跑完了（否则下面两条无从谈起）",
+                     got, f"等了 {time.time() - _t:.1f}s",
+                     hint="40 秒都没等到 `[管线·取词]` 这行 —— 说明连 "
+                          "recognize 都没走完，先看是不是撞上了"
+                          "「白名单 + 空库」那道更早的拦截"):
+        _dump_clip(app)
+        return
+
+    # ── 判据①：② 真的没被调用 ───────────────────────────────
+    # ⚠ 等一小会儿再判，不能立刻判：立刻判「0 次」的话，
+    #   ② 晚几百毫秒打过来也能通过 —— 那条断言就成了「暂时还没到」。
+    #   这里等的是【反面】的稳定：给足 ② 该到的时间，还是 0 次才算数。
+    BOX.wait_for(lambda: AIT.GOT.get("hits", 0) >= 1, 8)
+    BOX.check("★ 白名单 + 取词：模型【一次都没被调】（库外词一概不显示）",
+              AIT.GOT.get("hits", 0) == 0,
+              f"假服务器收到 {AIT.GOT.get('hits', 0)} 次请求",
+              hint="调了就是拿用户的钱去解释了不该显示的词")
+
+    # ── 判据②：屏幕上的话必须说清【这条路走不通】 ─────────────
+    panel = BOX.find_window(BOX.PANEL_TITLE, app.pid)
+    if not BOX.check("拿到主窗口句柄（白名单那一相）", bool(panel)):
+        _dump_clip(app)
+        return
+    # ★ 同 clip 那一相（L.11 ③.2）：先等「窗口已就位」再量几何。
+    BOX.wait_laid_out_or_warn(app.pid, APPLOG)
+    r = win32gui.GetWindowRect(panel)
+    origin = (r[0], r[1])
+    panel_rect = (r[0], r[1], r[2] - r[0], r[3] - r[1])
+
+    # ★ 白名单这个决定在界面上有【两个渲染点】，两个都要钉：
+    #   空态说明（renderStage2）和状态行（skipReason）。只钉一个的话，
+    #   把另一个改回去照样全绿 —— 同一字段有几个调用点就是几个守卫目标。
+    #   判据要挑【只有那一个渲染点才会出现】的字：
+    #     空态说明：「不会去问模型」      状态行：「没调模型」
+    BOX.check("★ 状态行说明了走的是白名单那条，不是那句「没找到值得解释的术语」",
+              find_on_panel(panel_rect, origin, "没调模型"),
+              hint="状态行那句是 skipReason 给的。停在「没找到值得解释的术语」上"
+                   "= 界面对用户撒谎：这段文字里【有】术语，它们只是不在库里")
+    BOX.check("★ 空态说明里也说了「取词这条通道没有本地词表」",
+              find_on_panel(panel_rect, origin, "词表"),
+              hint="这句是给用户看的【为什么按了没反应】。没有它，"
+                   "用户按一次 Ctrl+E 得到一片空白，唯一合理的猜测是「快捷键坏了」")
+    BOX.check("★ 界面上没有画任何库外的卡片（白名单的契约）",
+              not find_on_panel(panel_rect, origin, "抓手"),
+              hint="「抓手」上屏了 = ② 真的被调了、白名单被破了")
+
+    # ⚠⚠ 没被任何自动化测试覆盖的那一处，如实写在这里（别假装它验过了）：
+    #   `main.Api.explain()` 里「白名单模式下 clip 不绕空候选闸门」那道守卫
+    #   **端到端够不着** —— 前端 `runPipeline` 的闸门先短路了，explain 根本
+    #   不会被调到，它那句日志自然打不出来（2026-09-21 实测：断它必红）。
+    #   留着是因为「两处必须同时收」：前端那道一松，它就得顶上。
+    #   要真验它，得绕过前端直接调 js_api —— 那是另一件事，本文件不做。
+
+    WL_DONE[0] = True       # ← 跑到这里这一相才算【整相跑完】。见 main()。
 
 
 def _dump_clip(app):
@@ -450,6 +687,10 @@ def run(app):
     panel = BOX.find_window(BOX.PANEL_TITLE, app.pid)
     if not BOX.check("拿到主窗口句柄", bool(panel)):
         return
+    # ★ 先等「窗口已就位」再量几何（L.11 ③.2）。下面那条「贴所在屏的右边缘」
+    #   正是拿这个 rect 去比的 —— 窗口期里量到初始值时，它会红成「窗口没贴边」，
+    #   而真正的原因只是我们量早了。
+    BOX.wait_laid_out_or_warn(app.pid, APPLOG)
     r = win32gui.GetWindowRect(panel)
     origin = (r[0], r[1])
 
@@ -614,6 +855,8 @@ def run(app):
               "要么被错归到「AI 未采纳」")
 
     print("\n       结果截图：冒烟测试\\_ai_panel_result.png")
+
+    DONE[0] = True      # ← 跑到这里 region 那一相才算【整相跑完】。见 main()。
 
 
 def dump_hint():

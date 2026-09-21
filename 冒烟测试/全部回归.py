@@ -57,13 +57,13 @@ APP = os.path.join(os.path.dirname(HERE), "app")
 
 # (脚本名, 期望项数, 是否开窗口)
 SCRIPTS = [
-    ("知识库联调.py",       76, False),
+    ("知识库联调.py",       80, False),
     ("AI接入联调.py",       78, False),
     ("自动通道联调.py",     49, False),
     ("快捷键联调.py",       50, False),
     ("知识库端到端联调.py", 69, True),
-    ("AI端到端联调.py",     25, True),
-    ("框选联调.py",         16, True),
+    ("AI端到端联调.py",     32, True),
+    ("框选联调.py",         24, True),
     # 排最后：它自己会起一个「示例笔记」陪练窗口，并改写联调那份 settings
     # （`_e2e_settings.json`，不是用户真的那份）。放在其他开窗脚本前面的话，
     # 后面那些脚本会吃到它留下的区域设置。

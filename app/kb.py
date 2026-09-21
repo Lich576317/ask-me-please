@@ -405,11 +405,25 @@ def _claim(k, raw, pool, used):
     #   后果不止是「显示成一个单词」：展示 term 被改写成 `vector`，
     #   解释挂到 `vector` 的 key 上，再以 `vector` 的身份写进库 ——
     #   下一轮这个单词命中知识库，永远贴出这条词组级的解释，库里存错了。
+    #
+    # ⚠ 前缀认领只对【两侧都是 ASCII】生效（v0.20 / 决策 51），
+    #   和 `is_excluded` 的碎片兜底同一条理由、同一道守卫。
+    #   这段兜底是为**英文构词**写的（`Chunk` → `Chunking`，长度差 3），
+    #   而中文没有这种构词法 —— `_TERM_SLACK` 的「差 6」对中文等于放行一切：
+    #   中文术语普遍 2~4 个字，`闭环思维模型`(6) 和候选 `闭环思维`(4) 差 2，
+    #   前缀成立 → 整整一条解释被改写成短词，跟上面 `Vector DB` 那次一模一样：
+    #   展示 term 变短、解释挂错 key、再以短词身份写进库，下一轮永远贴错。
+    #   实测（2026-09-21 探针）：`闭环思维模型` → 认领成 `闭环思维`，
+    #   `对齐颗粒度模型` → 认领成 `对齐颗粒度`。
+    #   ★ 中英判据用 `k.isascii()` 而**不是**「含不含中文」：
+    #     混排词（`RAG检索`）同样不该走英文构词那条兜底。
     multiword = " " in raw
     hit = None
     for c in pool:
         ck = c["key"]
         if ck in used or len(ck) < 3 or len(k) < 3:
+            continue
+        if not (ck.isascii() and k.isascii()):
             continue
         if multiword and " " not in (c["term"] or ""):
             continue

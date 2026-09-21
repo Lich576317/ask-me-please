@@ -313,6 +313,11 @@ def run_phase_one(app, logpath, png_before):
     #   截图，截回来一片空白，后面每条 OCR 断言都「找不到字」——
     #   看着像自动通道挂了，其实只是截图基准错了。
     #   `知识库端到端联调.py` 一直是读 GetWindowRect 的，所以它当时全绿。
+    # ★ 再补一道（L.11 ③.2）：先等 app 自己说「窗口已就位」再量。
+    #   上面那段讲的「基准错了会静默全红」和这里是同一类事 —— 都是
+    #   拿一个【还没成立】的坐标当真。日志用本相自己的 `logpath`
+    #   （`_app_auto_{tag}.log`），别去读别人的。
+    BOX.wait_laid_out_or_warn(app.pid, logpath)
     wr = win32gui.GetWindowRect(panel)
     origin = (wr[0], wr[1])
     panel_rect = (wr[0], wr[1], wr[2] - wr[0], wr[3] - wr[1])
@@ -520,11 +525,18 @@ def main():
     note = BOX.start_note()
     time.sleep(2.0)
 
+    # ⚠ `rc` 必须先给个值：phase_one 里抛 ScreenLocked 的话，下面那两行
+    #   一行都没执行，finally 之后 `rc` 是【未绑定】—— 直接读它会 NameError。
+    rc = 1
     interrupted = False
     try:
         rc = phase_one()
         if rc == 0:
             rc = phase_two()
+            # ⚠ phase_two 的返回值从前【没人看】：`rc = phase_two()` 之后再没出现过，
+            #   于是它半路 return 1 也照样打一份完整的汇总行。
+            #   ★ 这和 `知识库端到端联调.py` ⑧ 那句 return 是同一个形状 ——
+            #     v0.20 的回归里它吞掉了 45 项。这里一并收口。
     except BOX.ScreenLocked:
         # 开局 `require_clean_screen()` 已经查过一次没锁 —— 所以走到这里，
         # 一定是【跑到一半才锁的】。措辞在 `BOX.lock_bail()` 里，四个脚本共用。
@@ -534,12 +546,17 @@ def main():
         kill(note)
         srv.shutdown()
 
-    if interrupted:
+    if interrupted or rc:
         # ⚠ 不能照常打汇总行、更不能返回 0 —— 整份是【截断的】。
         #   截断的一份报成「通过 N 项」就是在撒谎，而且是把
         #   「没验过」和「验过了没问题」说成同一个样子。
+        #
+        # ⚠ 锁屏只是截断的【一种】。两个 phase 里那些
+        #   `if not BOX.check(...): return 1` 是另一种，从前没人管。
         print("-" * 62)
         print(f"截断了：通过 {BOX._ok} 项，不通过 {BOX._fail} 项，后面的没跑")
+        if not interrupted:
+            print("       （是某一相里那句 if 没通过就 return 了，不是跑完了）")
         return 1
 
     print("-" * 62)

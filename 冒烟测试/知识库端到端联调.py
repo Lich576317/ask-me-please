@@ -126,6 +126,31 @@ AI_DELAY = 1.0        # 假服务器的思考时间。不用像 ② 那个脚本
 
 ROUND = [1]           # 第几轮提问。假服务器靠它把前后两次的回答区分开
 
+# ── 跑到哪了 ──────────────────────────────────────────────
+# ⚠ `run()` 里有二十几个提前 `return`（几乎每一步都有一句
+#   `if not BOX.check(...): return`）。它们【一个字都不打】就交卷，
+#   而 main() 照样打「通过 N 项，不通过 M 项」—— 读起来就是一份跑完的报告。
+#
+#   ★ v0.20 的回归里正是这个形状：⑧ 里一句 `if NEW_BLK_TERM not in after: return`
+#     把 ⑨⑩ 共 45 项【整段跳过】，而脚本自己报的是「通过 24 项，不通过 4 项」。
+#     抓出它的不是脚本，是 `全部回归.py` 那句「⚠ 期望 69 项，实到 24 项」——
+#     单独跑这个脚本的人，看到的是一份完整的绿报告。
+#
+#   ★ 本文件 main() 里已经写过这句话：「截断的一份报成『通过 N 项』就是在撒谎」。
+#     当时只防住了【锁屏】那一种截断 —— 而「没跑完」跟它是因为什么停的无关。
+#
+#   所以：每节开头走 step() 记下跑到哪，run() 最后一行置 FINISHED。
+#   main() 一看 FINISHED 没置上，就知道是中途停的，并且说得出停在哪儿 ——
+#   「前 24/69 项跑过，停在 ⑧」比「整段没跑」有用得多，也比「通过 24 项」诚实。
+WHERE = ["（还没开始）"]
+FINISHED = [False]
+
+
+def step(title):
+    """打一节的小标题，并记下跑到哪了（给 main() 那句「截断了」用）。"""
+    WHERE[0] = title.strip()
+    print("\n" + title)
+
 
 # ══════════════════════════════════════════════════════════
 # 假 DeepSeek：按收到的候选词现编解释
@@ -462,8 +487,66 @@ TOP_STRIP = 300         # 标题栏 + 操作台头部都在这条里。
                         #   只扫 300 高就不会，因为那张卡在下面。
 
 
+def console_top(panel_rect, notches=25):
+    """把操作台滚回【最顶上】。
+
+    ⚠ 为什么非要有这一步：`#view-console` **本身就是那个 .scroll 容器**，
+      两个视图是用 `hidden` 切的、不重建 DOM —— 所以**滚动位置会留着**。
+      上一节为了够到下面的卡片往下滚了，下一节 `open_console()` 进来时
+      它还停在老地方：`返回条目` 被滚出顶栏、上面几张卡也全在屏幕外。
+      于是红出来的是「操作台上找得到『返回条目』」/「操作台里找到
+      『可重复解释』」—— 每一条的原因都是错的，真因是【视口没归位】。
+
+    ⚠ 往上滚到底【不需要】知道滚过了多少：滚到顶之后再滚，浏览器就不动了。
+      所以这里可以放心地多滚（幂等），不用像往下找那样一格一格试。
+
+    ⚠ 光标摆在左边距上，不摆正中间：正中间可能落在 `<textarea>` 上，
+      那一下滚轮滚的是那个框、不是整页（System Prompt 展开时就会）。
+    """
+    BOX.wheel((panel_rect[0] + 24, panel_rect[1] + panel_rect[3] // 2), notches)
+    time.sleep(0.35)
+
+
+def scan_down(panel_rect, needles, tag, tries=8, notches=-4):
+    """在操作台里找 needles —— 一屏找不到就往下滚一点再找。
+
+    ⚠ 为什么要滚：`grab()` 只截【当前视口】。v0.20 往操作台加了一张
+      「快捷键取词」卡片，正好排在「屏蔽词」上面 —— 屏就那么大，
+      下面那张卡就被顶到折线以下了。**截图里没有它，而它其实好好渲染着。**
+      不滚的话，这条断言会顶着「功能坏了」的名字红，实际只是它在屏幕外 ——
+      而这两件事的修法完全不同（同 `框选联调.wheel` 的说明）。
+
+      ★ 这不是理论：v0.20 的回归里 ⑧ 就是这么红的（4 条），
+        当时的诊断结论是「屏蔽词的增删功能坏了」。本项目的原话 ——
+        **先分清「功能坏了」还是「它在折线以下屏幕外」，再动手查。**
+
+    ⚠ 只往下滚，所以调用它的顺序必须和卡片在流里的顺序一致。
+      一次 4 格 ≈ 12 行，远小于面板高度，不会一步跨过整张卡。
+
+    ⚠ 每次 `scan()` 最多跑四趟（整条 x1/x2 + 分段 x1/x2），找不到就白跑四趟 ——
+      所以这里只放【同一张卡上】的针，别拿它当通用扫描器使。
+    """
+    pos = (panel_rect[0] + 24, panel_rect[1] + panel_rect[3] // 2)
+    got = {}
+    for i in range(tries):
+        got = scan(panel_rect, needles, tag=f"{tag}s{i}" if i else tag)
+        if all(n in got for n in needles):
+            if i:
+                print(f"       （{tag} 往下滚了 {i} 格才进视口 —— 不是坏了）")
+            return got
+        if i < tries - 1:
+            BOX.wheel(pos, notches)
+            time.sleep(0.45)
+    return got
+
+
 def open_console(panel, panel_rect, box, tries=3):
-    """点标题栏齿轮进操作台。"""
+    """点标题栏齿轮进操作台。
+
+    ⚠ 进来之后【把滚动位置归零】—— 见 `console_top()`。
+      不加这一步，⑧ 为了够到「屏蔽词」往下滚过之后，
+      ⑨ 再进来找「可重复解释」就会扑空，而它报的是「按钮没了」。
+    """
     strip = (panel_rect[0], panel_rect[1], panel_rect[2], TOP_STRIP)
     hit = scan(strip, ["设置"], tag="gear")
     if not box.check("标题栏上找到齿轮「设置」", "设置" in hit,
@@ -481,8 +564,11 @@ def open_console(panel, panel_rect, box, tries=3):
                 print(f"       （齿轮点到第 {i + 1} 次才生效 ——"
                       f" 前 {i} 次被窗口激活吃掉了）")
             break
-    return box.check("点了齿轮，操作台出来了", ok,
-                     unless(ok, "点了 3 次都没进去"))
+    ok = box.check("点了齿轮，操作台出来了", ok,
+                   unless(ok, "点了 3 次都没进去"))
+    if ok:
+        console_top(panel_rect)
+    return ok
 
 
 def back_to_stream(panel, panel_rect, box, tries=3):
@@ -491,7 +577,12 @@ def back_to_stream(panel, panel_rect, box, tries=3):
     ⚠ 每次进操作台办完事【都要回来】：条目页上那些是动作（立即识别），
       操作台里那些是配置。切回来还有一层验证价值 ——
       两页是 hidden 互斥的，回得来就说明切换没把哪一页卡死。
+
+    ⚠ 先 `console_top()` 再找按钮：「返回条目」在 `.console-head` 里，
+      而它在**滚动容器内部** —— 上一节往下滚过了的话，它已经被滚出顶栏，
+      这一条会红成「操作台上找得到『返回条目』」。真因是滚动位置，不是按钮。
     """
+    console_top(panel_rect)
     strip = (panel_rect[0], panel_rect[1], panel_rect[2], TOP_STRIP)
     ok = False
     for i in range(tries):
@@ -712,13 +803,21 @@ def main():
         #   那块屏上跑的 app 读写的始终是 `_e2e_settings.json`。
         time.sleep(0.8)
 
-    if interrupted:
-        # ⚠ 不能照常打汇总行、更不能返回 0。
-        #   上面已经绿了的那些项是真的，但【整份是截断的】——
-        #   截断的一份报成「通过 N 项」就是在撒谎，而且是本项目最忌讳的
-        #   那种撒谎：把「没验过」和「验过了没问题」说成同一个样子。
+    # ⚠ 不能照常打汇总行、更不能返回 0。
+    #   上面已经绿了的那些项是真的，但【整份是截断的】——
+    #   截断的一份报成「通过 N 项」就是在撒谎，而且是本项目最忌讳的
+    #   那种撒谎：把「没验过」和「验过了没问题」说成同一个样子。
+    #
+    # ⚠ 说「截断」跟它是【因为什么】停的无关：锁屏是一种（interrupted），
+    #   `run()` 里二十几个提前 return 是另一种（没置上 FINISHED）。
+    #   从前只防住了锁屏那一种 —— 于是 v0.20 里 ⑧ 那句 `return`
+    #   把 ⑨⑩ 共 45 项整段跳过之后，脚本照样打「通过 24 项，不通过 4 项」。
+    #   两种截断，一句真话。
+    if interrupted or not FINISHED[0]:
         print("-" * 62)
         print(f"截断了：通过 {BOX._ok} 项，不通过 {BOX._fail} 项，后面的没跑")
+        print(f"       停在「{WHERE[0]}」"
+              f" —— 是那句 if 没通过就 return 了，不是跑完了。")
         return 1
 
     print("-" * 62)
@@ -727,20 +826,27 @@ def main():
 
 
 def run(app, note):
-    print("\n⓪ 先确认示例笔记真的在框选区域里")
+    step("⓪ 先确认示例笔记真的在框选区域里")
     seen = note_visible()
     if not BOX.check("示例笔记窗口在框选区域里（没被盖住）", seen,
                      unless(seen, "把挡在 (180,180)-(1220,720) 上的窗口挪开再跑")):
         return
 
-    print("\n① 主窗口就位")
+    step("① 主窗口就位")
     panel = BOX.find_window(BOX.PANEL_TITLE, app.pid)
     if not BOX.check("拿到主窗口句柄", bool(panel)):
         return
+    # ★ 先等 app 自己说「窗口已就位」再量（L.11 ③.2）。
+    #   pywebview 先建窗口、再回调 on_ready，窗口期里 `EnumWindows` 已经
+    #   看得见窗口，但 `layout("right")` 还没跑 —— 这时候量到的 rect 是初始值，
+    #   而下面每一段 scan 都拿它当截图基准，会一路「找不到字」。
+    #   ⚠ 日志必须是本脚本自己那份 APPLOG(`_app_kb.log`)：这个进程的
+    #     「已就位」只有这份日志里才有，读别人的等于拿别人的启动当自己的前置。
+    BOX.wait_laid_out_or_warn(app.pid, APPLOG)
     r = win32gui.GetWindowRect(panel)
     panel_rect = (r[0], r[1], r[2] - r[0], r[3] - r[1])    # 屏幕坐标，scan 直接用
 
-    print("\n② 界面上先要看得见库里有东西")
+    step("② 界面上先要看得见库里有东西")
     # 界面启动时会 loadSettings() → renderKb()，「库中 N 条」应该已经在上面了。
     # 这一条同时证明知识库卡片真的渲染出来了（否则后面点它的按钮都是空谈）。
     hit = {}
@@ -756,7 +862,7 @@ def run(app, note):
     print(f"       库中 pill @ {hit.get('库中')}　立即识别 @ {hit.get('立即识别')}")
 
     # ══════════ 第 1 轮：dedupe，库里已有 RAG ══════════
-    print("\n③ 第 1 轮：策略「不重复解释」，库里已经有一条 RAG")
+    step("③ 第 1 轮：策略「不重复解释」，库里已经有一条 RAG")
     ROUND[0] = 1
     clicked = click_until(
         panel, hit["立即识别"],
@@ -784,7 +890,7 @@ def run(app, note):
     raw_part = user.split(CAND_MARK, 1)[0] if CAND_MARK in user else user
     cands = cands_of(user)
 
-    print("\n④ ★ 这一轮的重点：库里已有的词，有没有真的不问模型")
+    step("④ ★ 这一轮的重点：库里已有的词，有没有真的不问模型")
     BOX.check("user message 的【原文段】里仍然有 RAG", "RAG" in raw_part,
               "原文是整篇照发的，模型要靠它理解上下文")
     BOX.check("★ user message 的【候选词段】里【没有】RAG",
@@ -797,7 +903,7 @@ def run(app, note):
               "流水只留给「新解释出来的东西」—— 命中的词再灌一遍，只会让它白白翻倍")
 
     # ══════════ 界面：来源标记 ══════════
-    print("\n⑤ 界面：知识库那一条要贴出来，并且标出来源")
+    step("⑤ 界面：知识库那一条要贴出来，并且标出来源")
     time.sleep(1.5)
     ui = {}
     for _ in range(8):
@@ -812,7 +918,7 @@ def run(app, note):
     BOX.check(f"要排除的那个词「{EXCLUDE_TERM}」在界面上（下面要右键它）",
               EXCLUDE_TERM in ui)
 
-    print("\n⑥ 自动收录：模型答过的词，这一轮就该进库了")
+    step("⑥ 自动收录：模型答过的词，这一轮就该进库了")
     row = db("SELECT explanation FROM terms WHERE key=?", (kb_mod.canon(EXCLUDE_TERM),))
     BOX.check(f"「{EXCLUDE_TERM}」已经自动进了库（dedupe 模式）", bool(row),
               "没进库的话，「不重复解释」的省钱承诺要等用户手动点一次才开始生效")
@@ -821,7 +927,7 @@ def run(app, note):
                   f"第 1 轮解释" in row[0]["explanation"], row[0]["explanation"][:40])
 
     # ══════════ 右键排除 ══════════
-    print("\n⑦ 右键条目「不再解释该词」")
+    step("⑦ 右键条目「不再解释该词」")
     if EXCLUDE_TERM not in ui:
         BOX.check("拿到卡片坐标才能右键", False, "上一步没找到这个词")
         return
@@ -868,7 +974,7 @@ def run(app, note):
               "两个条件同时成立，才说明「排除 > 命中」这条顺序是对的")
 
     # ══════════ 操作台里的屏蔽词（v0.11 补的集中管理页）══════════
-    print("\n⑧ 操作台的屏蔽词：⑦ 右键加的那个词，在这一页看得见、删得掉")
+    step("⑧ 操作台的屏蔽词：⑦ 右键加的那个词，在这一页看得见、删得掉")
 
     # ⚠ 这一节是 v0.11 才补的断言。功能本身也是 v0.11 才有的：
     #   在那之前，排除名单是个【单向门】—— 右键加进去的词，界面上
@@ -884,7 +990,11 @@ def run(app, note):
     if not open_console(panel, panel_rect, BOX):
         return
 
-    card = scan(panel_rect, ["屏蔽词", "添加", EXCLUDE_TERM, "1个"], tag="blk")
+    # ⚠ 这里【必须】用 scan_down 而不是 scan：v0.20 起「屏蔽词」排在
+    #   「快捷键取词」下面，默认视口里够不着（`grab()` 只截一屏）。
+    #   用 scan 的话，下面那 4 条会一起红成「屏蔽词的增删坏了」——
+    #   而功能一点没坏，只是那张卡在折线以下。附录 L.9。
+    card = scan_down(panel_rect, ["屏蔽词", "添加", EXCLUDE_TERM, "1个"], tag="blk")
     BOX.check("操作台里有「屏蔽词」这一栏", "屏蔽词" in card,
               unless("屏蔽词" in card, "截图：冒烟测试\\_e2e_blk1.png"))
     BOX.check(f"★ ⑦ 用右键加进去的 {EXCLUDE_TERM}，在这一页也列着（同一个名单）",
@@ -895,6 +1005,9 @@ def run(app, note):
               unless("1个" in card, "计数和列表对不上，用户会以为加漏了"))
 
     # ── 从这一页自己加一个词 ──────────────────────────────
+    # ⚠ 上面那次 scan_down 已经把这一卡滚进视口了，这里【不用再滚】——
+    #   但也别退回成 scan：`card` 是在滚过之后拿到的，之后不改滚动位置，
+    #   这几针才在同一屏上。要改就得一起改。
     inp = scan(panel_rect, ["输入要屏蔽的词"], tag="blk-in")
     add = scan(panel_rect, ["添加"], tag="blk-add")
     if not BOX.check("找得到屏蔽词输入框和「添加」按钮",
@@ -954,7 +1067,10 @@ def run(app, note):
               unless(added, f"点完 4 秒，excluded 表里还是没有 "
                             f"{kb_mod.canon(NEW_BLK_TERM)}　{BOX.fg_info()}"))
 
-    after = scan(panel_rect, ["已屏蔽", NEW_BLK_TERM, "2个"], tag="blk2")
+    # ⚠ 也用 scan_down：名单刚长了一行，下面那些内容整体下移了 ~30px，
+    #   原来贴着底边的那一屏可能正好把新行漏在折线以下。
+    #   不滚的话，「新加的词出现在列表里」会红 —— 而它其实加上了、也画出来了。
+    after = scan_down(panel_rect, ["已屏蔽", NEW_BLK_TERM, "2个"], tag="blk2")
     BOX.check("界面回了「已屏蔽…」（看得见的反馈，不是默默加上了）",
               "已屏蔽" in after, unless("已屏蔽" in after, "截图：冒烟测试\\_e2e_blk2.png"))
     BOX.check("新加的词出现在列表里", NEW_BLK_TERM in after,
@@ -967,6 +1083,11 @@ def run(app, note):
     #   整屏扫"恢复"的话，Chunking 那行也有一个，拿到哪个全看 OCR 的遍历顺序 ——
     #   拿到 Chunking 的那条，会以「恢复没生效」的样子红，而其实点错了行。
     if NEW_BLK_TERM not in after:
+        # ⚠ 这句话从前是光秃秃一个 return —— 它一执行，⑨⑩ 共 45 项【整段没跑】，
+        #   而脚本照样打「通过 N 项，不通过 M 项」。v0.20 的回归就是这么被骗过去的。
+        #   现在 main() 靠 FINISHED 认得出这种截断（见那边），这里再点一句，
+        #   是为了让人一眼看出【是从这一条断的】。
+        print(f"       ★ 这一条没通过 —— ⑨⑩ 和导出那几节【整段没跑】，不是跑完了。")
         return
     band = (panel_rect[0], after[NEW_BLK_TERM][1] - 24, panel_rect[2], 48)
     un = scan(band, ["恢复"], tag="blk-un")
@@ -1005,7 +1126,8 @@ def run(app, note):
                       (kb_mod.canon(EXCLUDE_TERM),))),
               f"名单现在 = {[dict(r) for r in db('SELECT key, term FROM excluded')]}")
 
-    back = scan(panel_rect, ["已恢复", "1个"], tag="blk3")
+    # ⚠ 同 `after`：删掉一行会让下面的内容上移，那一屏也可能不再对得上。
+    back = scan_down(panel_rect, ["已恢复", "1个"], tag="blk3")
     BOX.check("界面上它也没了，计数回到 1 个",
               "已恢复" in back and "1个" in back,
               unless("已恢复" in back and "1个" in back,
@@ -1015,7 +1137,7 @@ def run(app, note):
         return
 
     # ══════════ 第 2 轮：repeat，验证策略真的生效 ══════════
-    print("\n⑨ 切到「可重复解释」再跑一轮 —— 策略必须真的管用")
+    step("⑨ 切到「可重复解释」再跑一轮 —— 策略必须真的管用")
 
     # ⚠ 跑第 2 轮之前【必须再验一次】笔记还在不在。
     #   第 1 轮到现在隔了右键、弹提示、切策略好几次点击，几十秒里那块
@@ -1092,7 +1214,7 @@ def run(app, note):
     user2 = msgs2[1].get("content", "") if len(msgs2) > 1 else ""
     cands2 = cands_of(user2)
 
-    print("\n⑩ ★ 第 2 轮的重点：库被绕过了，但排除名单还拦着")
+    step("⑩ ★ 第 2 轮的重点：库被绕过了，但排除名单还拦着")
     BOX.check("★ 候选词段里【重新出现了】RAG（repeat 绕过了知识库）",
               any("RAG" == c for c in cands2), f"候选词 = {cands2}")
     BOX.check(f"★ 候选词段里【没有】{EXCLUDE_TERM}（排除名单拦住了）",
@@ -1101,7 +1223,7 @@ def run(app, note):
               len(cands2) >= 3, f"候选词 = {cands2}")
 
     # ══════════ 收纳历史 ══════════
-    print("\n⑩ 收纳历史：把 repeat 这轮重新问出来的新版解释收编进库")
+    step("⑩b 收纳历史：把 repeat 这轮重新问出来的新版解释收编进库")
     before = db("SELECT explanation FROM terms WHERE key=?",
                 (kb_mod.canon(SEED_TERM),))[0]["explanation"]
     BOX.check("收编前，库里还是那条老的", SEED_EXPL == before, before[:40])
@@ -1132,7 +1254,11 @@ def run(app, note):
               src == "harvest", src)
 
     # ══════════ 导出 md ══════════
-    print("\n⑪ 导出 md（还在操作台里，不用再点一次齿轮）")
+    step("⑪ 导出 md（还在操作台里，不用再点一次齿轮）")
+    # ⚠ 上面每一节的 `if not BOX.check(...): return` 都会【静默交卷】。
+    #   `main()` 靠这一面旗子分辨「跑完了」和「半路停了」——
+    #   **只有跑到最后一行才算跑完**。加新节的时候，把新代码写在
+    #   最后那句 `FINISHED[0] = True` 前面，别写在它后面（写在后面 = 白写）。
     # ⚠ 找的是「导出md」不是「导出」。这一页上带「导出」二字的地方不止按钮：
     #   上面那个输入框的 placeholder 就是「导出目录」。搜「导出」的话，
     #   scan 取的是【第一条命中的行】，很可能取到输入框 —— 点上去毫无反应，
@@ -1192,6 +1318,8 @@ def run(app, note):
 
     print("\n       结果截图：冒烟测试\\_e2e_r11.png（第 1 轮卡片）"
           " / _e2e_export1.png（收尾那一屏）")
+
+    FINISHED[0] = True      # ← 跑到这里才算【整份跑完】。见 main() 里那段说明。
 
 
 def cols_of(line):

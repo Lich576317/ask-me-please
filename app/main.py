@@ -511,7 +511,7 @@ class Api:
         if cands is None:
             cands = [{"term": t, "key": kb.canon(t)} for t in (payload.get("候选词") or [])]
 
-        if not cands and mode == "clip":
+        if not cands and mode == "clip" and self.settings.get("kb_policy") != "whitelist":
             # ★ clip 通道【故意绕过】下面那道空候选闸门（决策 50，破例二）。
             #
             #   那道闸门在 region 上是对的，理由一字未改地写在 elif 里。
@@ -521,6 +521,22 @@ class Api:
             #   这正是这条通道存在的意义（用户拍板：解释对象仍是术语，中英都认）。
             #   在这里拦住它 = 用户按了快捷键，面板上什么都不出现。
             print("[管线·取词] 无规则候选，交给模型直接从原文里挑术语", flush=True)
+        elif not cands and mode == "clip":
+            # ⚠⚠ 白名单模式下 clip【收回】这个破例（2026-09-21，决策 52）。
+            #
+            #   上面那段放行的理由是「中文只能靠 ② 从原文里挑」，而白名单的
+            #   契约恰恰是「不在库里的词一概不显示」（设置页那行说明原文）——
+            #   ② 挑出来的词【必然不在库里】，所以放行 = 当着用户的面破掉
+            #   产品自己写的那条规矩。前端 runPipeline 里同一道闸门同时收。
+            #
+            #   代价说清楚：白名单 + 中文取词【结构上】永远不会命中 ——
+            #   ① 的规则初筛只认英文字母，中文给不出候选，而它没有本地词表。
+            #   所以这里不是「这次没捞到」，是「这条路走不通」，
+            #   返回的话要和「全被知识库回答了」区分开，别让用户以为换个词就行。
+            print("[管线·取词] 白名单模式下不绕空候选闸门（库外词一概不显示）",
+                  flush=True)
+            return {"ok": True, "entries": [], "seconds": 0, "usage": {},
+                    "skipped": "白名单模式下没有库内命中"}
         elif not cands:
             # 全被知识库回答了。这时候【必须】不调模型 ——
             # 给模型发一个空候选列表不光白烧 token，

@@ -16,7 +16,9 @@
 
 跑之前请把别的「问了吗」关掉 —— 脚本会自己起一个干净实例。
 """
+import contextlib
 import ctypes
+import io
 import json
 import os
 import subprocess
@@ -58,6 +60,9 @@ import capture                                                    # noqa: E402
 import shell as shell_mod                                         # noqa: E402
 
 PANEL_W = shell_mod.PANEL_W
+# 等「窗口已就位」的上限。单独拎出来是因为那句 ⚠ 文案要把秒数说出来 ——
+# 写死在文案里的话，改了这个数、文案就开始撒谎（2026-09-21 变体实测过）。
+LAYOUT_WAIT = 15.0
 SAMPLE = os.path.join(HERE, "_sample_note.txt")
 NOTE_SCRIPT = os.path.join(HERE, "_note_window.py")
 APPLOG = os.path.join(HERE, "_app.log")
@@ -91,15 +96,37 @@ Prompt Engineering 需要反复迭代
 _ok = 0
 _fail = 0
 
+# run() 整段跑完了没有。
+# ⚠ `run()` 里每个 `if not check(...): return` 都是【静默交卷】——
+#   一个字不打就还回去，而 main() 照样打「通过 N 项，不通过 M 项」。
+#   ★ `知识库端到端联调.py` 的 ⑧ 里就有一句这种 return，v0.20 的回归里
+#     它把后面 45 项整段跳过，而脚本报的是「通过 24 项，不通过 4 项」。
+#   main() 里那句「截断的一份报成『通过 N 项』就是在撒谎」只防住了锁屏 ——
+#   而「没跑完」跟它是因为什么停的无关。旗子补上这一种。
+DONE = [False]
 
-def check(name, cond, detail=""):
+
+def check(name, cond, detail="", hint=""):
+    """`detail` 是【中性观察】，通过和不通过都会打出来。
+    `hint` 是【只有不通过时才说的话】——「该往哪看」。
+
+    ⚠ 两者混用会让脚本在【通过】的那一行上说反话。真发生过两次：
+      · 「启动时删掉了遗留底图」通过时打的是「还在：app\\web\\_shot.png」
+      · 「拖框守卫会吭声」通过时打的是「守卫那段一个字都没打」
+      读者看到的是「[通过] + 一句说它没做到的话」。这类话最容易被当成
+      噪音略过，于是**测试自己把自己的可信度磨掉了**。
+      ★ 一句只在错误的那一边才成立的文案，等于没有文案。
+
+    ⚠ 判据：`detail` 里不该出现「没」「还在」「一个字都」这类
+      只有在失败时才为真的词 —— 有的话它就该是 `hint`。
+    """
     global _ok, _fail
     if cond:
         _ok += 1
         print(f"  [通过] {name}" + (f"　{detail}" if detail else ""))
     else:
         _fail += 1
-        print(f"  [不通过] {name}　{detail}")
+        print(f"  [不通过] {name}　{detail}" + (f"　— {hint}" if hint else ""))
     return cond
 
 
@@ -259,7 +286,14 @@ def require_unlocked():
     return False
 
 
-def confirm_lock(tries=12, gap=0.25):
+# `confirm_lock()` 的两个默认参数。拎出来是因为下面那条断言要把「等多久」
+# 说给人听 —— 写死在文案里的话，改了参数文案就开始撒谎
+# （2026-09-21 那个「15 秒」和「这几百毫秒」都是这么来的）。
+LOCK_TRIES = 12
+LOCK_GAP = 0.25
+
+
+def confirm_lock(tries=LOCK_TRIES, gap=LOCK_GAP):
     """截屏【已经报错】之后，再花几秒问清楚：这是锁屏，还是真截不到。
 
     返回 True = 锁屏（调用方去 `raise ScreenLocked`）。
@@ -278,7 +312,12 @@ def confirm_lock(tries=12, gap=0.25):
       原样把异常抛出去。所以它不可能凭空造出一个「通过」。
 
     ⚠ 没量过的地方如实写在这儿：**等多久才够，没测过。**
-      12 × 0.25s = 3 秒是拍的；切换比这慢的话照样会崩。
+      等待时长就是 `LOCK_TRIES × LOCK_GAP`，那两个数是拍的；
+      切换比它慢的话照样会崩。
+      ⚠ 这里【故意不写「3 秒」】—— 写死了，改常量的人不会跟着改这行，
+        于是它就变成一句在骗人的注释（2026-09-21 的「15 秒」就是这么来的）。
+      （2026-09-21 起「实际等的就是 LOCK_TRIES × LOCK_GAP」有断言钉着了，
+      见 `t_confirm_lock`；「这个时长够不够」仍然没测，那要有一次真锁屏才量得到。）
       真要更准，`ScreenShotError.details["error_code"]` 里带着 winerror 码
       （「拒绝访问」应当是 5 = ERROR_ACCESS_DENIED，**不随系统语言变**，
       这点比按错误文案匹配强），拿它当判据比硬等时间准得多 ——
@@ -480,6 +519,119 @@ def wait_for(ok, timeout, tick=0.2):
         time.sleep(tick)
 
 
+def wait_laid_out(timeout=LAYOUT_WAIT, logpath=None):
+    """等 app 自己打出「窗口已就位」。
+
+    ⚠ 那行是 `main.on_ready` 里 `layout("right")` **之后**打的
+      (`main.py` 的 on_ready)，所以它出现 = 窗口已经摆好了。
+
+    ★ 为什么非等不可：pywebview 是【先建窗口、再回调 on_ready】—— 窗口一出现
+      `EnumWindows` 就看得见它，而那会儿 `layout()` 可能【还没跑】。
+      在窗口期里量几何，量到的是 pywebview 给的初始值，不是产品的摆位结果。
+
+    ★★ 2026-09-21：那个「没能证实的 `rect=(0,0,758,1294)`」**量到了**，
+      就是这里说的窗口期。20 毫秒采一次，两次都抓到同一串（下面是 UNaware
+      进程读到的虚拟化坐标，×1.5 就是 框选联调 那种 aware 进程读到的）：
+
+        t=0.558s  (101,101,621,1001) 520×900  可见=0   ← create_window 的 520×900
+        t=0.600s  (0,0,505,863)               可见=0
+        t=0.621s  (0,0,505,863)               可见=1   ← 窗口【已经可见】了
+        t=0.643s  (1360,0,1707,1067)          可见=1   ← layout("right") 之后
+
+      `505×863` × 1.5 = `758×1294`（Windows 的虚拟化取整：505.33→505、
+      862.67→863），**和那次红的一模一样**。所以：
+        · 是解释①（读早了），**不是**解释②（找错窗口）——
+          全程只有 1 个同名窗口，类名 `WindowsForms10.Window.8.app…`，就是我们那张
+        · 这个状态只存在 **20~40 毫秒**，而且其中大半是不可见的 ——
+          所以 0.15 秒采一次的旧探针整个跳过了它，所以它只红过一次
+      ★ 顺带说明为什么非等那行日志不可：几何在 `(0,0,505,863)` 上停留的那
+        20 毫秒里，窗口【已经是可见的】，任何「看见窗口就算摆好了」的判据
+        都拦不住它。
+
+    ⚠ 判据用 app 自己打的那行，**不是**「轮询到 rect 变对为止」——
+      后者是把断言要验的东西当成等待条件，等到了再断言它，那条断言就永远绿了。
+      这行日志是 app 在摆好之后主动打的，跟「摆得对不对」是两件事，拿它当前置条件才不自欺。
+
+    ⚠ 也**不是**「睡 N 秒」：睡多久都是猜，而这行日志是能证明的。
+
+    ⚠ `logpath` 默认是本文件的 `_app.log`。另外三个开窗脚本各有各的日志
+      （`知识库端到端联调.py` 是 `_app_kb.log`…），要用这个助手得把路径传进来 ——
+      **别让它们去读别人的日志**：两个进程往同一份日志里写，判据就全建在脏数据上了
+      （本文件 `run_clip` 那段的教训）。
+    """
+    path = logpath or APPLOG
+
+    def ok():
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return any("窗口已就位" in ln for ln in f)
+        except FileNotFoundError:
+            return False
+    return wait_for(ok, timeout, tick=0.1)
+
+
+def dump_geom(pid):
+    """把进程里所有同名窗口连【类名】/ rect / 可见性一起打出来。只在几何对不上时用。
+
+    ★ 为什么要有它：2026-09-21 那轮 `框选联调.py` 读到 rect=(0,0,758,1294)，
+      **量了、却不知道量到的是谁**。两种解释都装得下那串数字：
+        ① 窗口还没摆好就被读走了
+        ② `find_window` 挑中的是【另一个】同名窗口
+      而这两件事的修法完全不同（一个是等，一个是改找法）。
+      当时日志里只有一行数字，所以只能重跑一遍去猜 —— 这条诊断就是为了
+      「下次再红时，日志自己说得出是哪种」。
+
+    ★ 类名是 2026-09-21 补的，而它正是最后破案的那个字段：
+      那次 `758×1294` 是「同名窗口几个」答不了的 —— 答案要的是
+      **这一行到底是不是我们那张窗**。类名一看就知道
+      （本产品的是 `WindowsForms10.Window.…`，WebView2 的辅助窗是别的）。
+      没有它，`hwnd=… rect=…` 两行长得一模一样，还是得猜。
+    """
+    out = []
+
+    def cb(h, _):
+        if win32gui.GetWindowText(h) != PANEL_TITLE:
+            return True
+        try:
+            if win32process.GetWindowThreadProcessId(h)[1] != pid:
+                return True
+        except Exception:
+            return True
+        out.append(f"hwnd={h} 类名={win32gui.GetClassName(h)} "
+                   f"可见={bool(win32gui.IsWindowVisible(h))} "
+                   f"rect={win32gui.GetWindowRect(h)}")
+        return True
+
+    win32gui.EnumWindows(cb, None)
+    return ("　★ 这个进程里同名窗口 " + str(len(out)) + " 个："
+            + ("；".join(out) if out else "（一个都没有）"))
+
+
+def wait_laid_out_or_warn(pid, logpath, timeout=LAYOUT_WAIT):
+    """`wait_laid_out` + 没等到时把现场打出来。四个开窗脚本共用这一份。
+
+    ★ 为什么四个都要挂：2026-09-21 之前只有本文件在量几何前等这一下，
+      另外三个都是 `find_window` 之后【直接】`GetWindowRect`。它们量到的
+      同样是 pywebview 的初始值 —— 区别只是那三个当时没红，所以没人发现。
+      「这次没红」不是「这条路径安全」。
+
+    ⚠ `logpath` 必须传【自己那份】日志。传别人的 = 拿另一个进程的启动记录
+      当自己的前置条件：对方先到位，这边就跟着放行，而这边可能压根还没摆好
+      （两个进程写同一份日志时，本文件 `run_clip` 那段已经吃过一次亏）。
+
+    ⚠ 返回值**不**当断言用 —— 没等到不是「产品坏了」，是「这次没证据说它摆好了」。
+      真的没摆好的话，下面那些几何/OCR 断言照样会红，由它们去报。
+    """
+    if wait_laid_out(timeout, logpath):
+        return True
+    # ⚠ 秒数用参数，别在文案里写死（2026-09-21 变体实测：传 timeout=3，
+    #   文案照样说「15 秒」—— 文案和真等的时间可以各说各话）。
+    print(f"       ⚠ {timeout:g} 秒内没等到「窗口已就位」"
+          f"（日志：{os.path.basename(logpath)}），几何可能是 pywebview 的初始值。"
+          + dump_geom(pid))
+    return False
+
+
 def fg_info():
     """现在前台是哪个窗口 —— 只在失败时打印，用来一眼分辨
     「窗口没抢到前台」和「点到了但产品没反应」这两件完全不同的事。"""
@@ -631,12 +783,130 @@ def reset_region():
         }, f, ensure_ascii=False, indent=2)
 
 
+def t_confirm_lock():
+    """④ `confirm_lock()` 那条【从没执行过】的分支，真的跑一遍。
+
+    ⚠ 它只在 `grab()` 的 `except ScreenShotError` 里被调到，而那条路要求
+      「截屏失败了、屏幕却【没】锁」—— 本机跑了这么多轮一次都没出现过。
+      也就是说从写下来到今天，这个循环【一次都没转过】。
+      「写了但从没生效」和「还没写」在日志里长得一模一样（L.11 ④），
+      所以要么造条件、要么写明没验过 —— 这里选造条件。
+
+    ⚠ 用的是【换判据】不是【造锁屏】：把 `screen_locked` 换成脚本控制的假函数。
+      跑的是 `confirm_lock` 自己的真循环。代价如实写在这：
+      **「真锁屏时它认不认得出」这一环仍然没验** —— 那要一次真的锁屏，
+      而锁屏跑回归是本项目明令禁止的（见 `全部回归.py` 开头那段）。
+
+    ⚠ 这条判据的设计意图是「只会往『没验』那边错」。第①条钉的就是它：
+      它要是往另一边错（没锁却说锁了），一次偶发的截屏失败就会被报成
+      「锁屏」—— 整个脚本静默跳过，还附一句「这不是产品坏了」。
+    """
+    global screen_locked
+    real = screen_locked
+    try:
+        # ① 一直没锁：必须返回 False，而且【不能】raise
+        screen_locked = lambda: False
+        t0 = time.time()
+        got = confirm_lock()
+        dt = time.time() - t0
+        check("确认锁屏：一直没锁时返回 False（不会把一次截屏失败说成「锁屏」）",
+              got is False, f"返回了 {got!r}")
+        check(f"确认锁屏：等法真是 {LOCK_TRIES}×{LOCK_GAP:g}"
+              f"={LOCK_TRIES * LOCK_GAP:g} 秒（docstring 里写的那个数）",
+              abs(dt - LOCK_TRIES * LOCK_GAP) < 0.6, f"实际 {dt:.2f}s")
+
+        # ② 第 3 次才锁上 —— 这一条才证明它【在轮询】。
+        #    「查一次就下结论」正是它 docstring 里说不能做的那件事；
+        #    不钉的话，把循环改成一次性的照样全绿。
+        seen = {"n": 0}
+
+        def flaky():
+            seen["n"] += 1
+            return seen["n"] >= 3
+
+        screen_locked = flaky
+        t1 = time.time()
+        got2 = confirm_lock()
+        dt2 = time.time() - t1
+        check("★ 确认锁屏：中途才锁上的认得出（是轮询，不是查一次就下结论）",
+              got2 is True and seen["n"] == 3,
+              f"返回 {got2!r}，一共查了 {seen['n']} 次")
+        check("确认锁屏：认出来就立刻收工，不把 3 秒等满",
+              dt2 < 1.5, f"实际 {dt2:.2f}s")
+    finally:
+        screen_locked = real
+
+
+def t_drag_guard():
+    """④ `drag()` 里那段「光标被挪走了就摆回去」的守卫，真的跑一遍。
+
+    ⚠ 健康路径上它是**空的**（光标本来就在 p0，第一次检查就 break），
+      所以从写下来到今天一次都没转过 —— 和 `confirm_lock` 同一个形状。
+
+    ⚠ 造条件的办法：把 `SetCursorPos` 换成一个什么都不做的桩。于是
+      「摆光标」失效，守卫那段就真的跑起来了。
+      **`mouse_event` 也一起换掉**：不换的话这条测试会真的按下左键、
+      在用户当时的光标位置上点一下 —— 测一段代码不该有这个副作用。
+
+    ⚠ 两条都要断言「它走到了按下那一步」（用 mouse_event 的计数），
+      不能只断言「没打那行字」—— 那样 `drag` 半路抛异常、一个字没打，
+      第二条也会绿。**空转通过和通过长得一样**（本项目老账）。
+    """
+    real_set = win32api.SetCursorPos
+    real_get = win32api.GetCursorPos
+    real_evt = win32api.mouse_event
+    evt = {"n": 0}
+    try:
+        win32api.SetCursorPos = lambda p: None            # 摆了也不动
+        win32api.mouse_event = lambda *a, **k: evt.__setitem__("n", evt["n"] + 1)
+
+        # ① 起点摆不到（用真光标位置：它不可能正好在 99999,99999）
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            drag((99999, 99999), (99999, 99999), steps=2)
+        out = buf.getvalue()
+        check("★ 拖框守卫：光标摆不到起点时它会吭声（这段代码从没执行过）",
+              "光标没摆到" in out, f"守卫那段打了 {out.count('光标没摆到')} 行",
+              hint="一行都没打 —— 要么没执行到，要么它不吭声了")
+        check("拖框守卫：吭声时把「现在在哪」也说了（不然没法判断是谁在动光标）",
+              "现在在" in out, f"实际输出：{out.strip()[:120]!r}")
+        check("拖框守卫：吭完声照常往下拖（不是卡在那儿）",
+              evt["n"] >= 1, f"mouse_event 被调了 {evt['n']} 次")
+
+        # ② 反向对照：判据说「光标就在起点」时，守卫必须【不】吭声。
+        #    没有这一条，「它吭声了」可能只是因为它无条件打那行字。
+        #    ⚠ 这里连 GetCursorPos 一起换成桩：拿真光标位置的话，
+        #      这 0.25 秒里人手碰一下鼠标就会让这条断言偶发地红。
+        win32api.GetCursorPos = lambda: (99999, 99999)
+        evt["n"] = 0
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            drag((99999, 99999), (99999, 99999), steps=2)
+        out2 = buf2.getvalue()
+        check("拖框守卫：反向对照 —— 光标本来就在起点时它【不】吭声",
+              "光标没摆到" not in out2 and evt["n"] >= 1,
+              f"输出 {out2.strip()[:80]!r}，mouse_event {evt['n']} 次")
+    finally:
+        win32api.SetCursorPos = real_set
+        win32api.GetCursorPos = real_get
+        win32api.mouse_event = real_evt
+
+
 def main():
     print("=" * 62)
     print("问了吗 · 框选 + 识别 联调")
     print("=" * 62)
     if not require_clean_screen():
         return 1
+
+    # ★ 先把两条【从没执行过】的分支跑掉（L.11 ④）。它们不需要窗口，
+    #   放在这里是因为下面每条 `if not check(...): return` 都可能提前交卷 ——
+    #   摆在最前面，才不会因为它们排在谁后面而跟着一起不跑。
+    #   ⚠ 也【不能】摆到 `require_clean_screen()` 前面：那样锁屏时它们会跑，
+    #     而 `全部回归.py` 对锁屏那一种报的是「整段没跑」—— 报的就不是实话了。
+    print("\n⓪ 两条从没执行过的分支（不需要窗口，先跑掉）")
+    t_confirm_lock()
+    t_drag_guard()
 
     open(SAMPLE, "w", encoding="utf-8").write(NOTE_TEXT)
     reset_region()
@@ -692,13 +962,19 @@ def main():
             subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if interrupted:
+    if interrupted or not DONE[0]:
         # ⚠ 不能照常打汇总行、更不能返回 0。上面已经绿了的项是真的，
         #   但整份是【截断的】—— 截断的一份报成「通过 N 项」就是在撒谎，
         #   而且是本项目最忌讳的那种撒谎：把「没验过」和「验过了没问题」
         #   说成同一个样子。
+        #
+        # ⚠ 锁屏（interrupted）只是截断的【一种】。`run()` 里那七八句
+        #   `if not check(...): return` 是另一种，从前一个人都不管 ——
+        #   v0.20 的回归里 `知识库端到端联调.py` 就是这么把 45 项静默跳过去的。
         print("-" * 62)
         print(f"截断了：通过 {_ok} 项，不通过 {_fail} 项，后面的没跑")
+        if not interrupted:
+            print("       （是 run() 里那句 if 没通过就 return 了，不是跑完了）")
         return 1
 
     print("-" * 62)
@@ -718,15 +994,23 @@ def run(app):
     #   （_clear_shots 在 Shell() 之前，窗口在 on_ready 里才建）。
     check("★ 启动时删掉了上次遗留的框选底图（整个桌面的截图不该留在盘上）",
           not os.path.exists(os.path.join(APP, "web", "_shot.png")),
-          "还在：app\\web\\_shot.png")
+          hint="还在：app\\web\\_shot.png")
+
+    # ★ 先等 app 自己说「摆好了」，再量几何。理由见 `wait_laid_out` 的说明。
+    #   不是断言，是环境说明 —— 真的没摆好的话下面两条照样会红。
+    wait_laid_out_or_warn(app.pid, APPLOG)
 
     r = win32gui.GetWindowRect(panel)
     size = (r[2] - r[0], r[3] - r[1])
     mon = screen_box(panel)                      # 面板所在那块屏（见 screen_box 说明）
-    check("主窗口贴【所在屏】的右边缘",
-          r[2] == mon[2] and r[0] == mon[2] - PANEL_W, f"rect={r}　屏={mon}")
-    check("主窗口铺满【所在屏】的屏高",
-          size == (PANEL_W, mon[3] - mon[1]), f"size={size}　屏={mon}")
+    # ⚠ 两条的 detail 在对不上时补一句 dump_geom()：那是「量到的是谁」，
+    #   跟上面那串数字是两回事 —— 2026-09-21 红的那次就只留了数字。
+    ok_r = r[2] == mon[2] and r[0] == mon[2] - PANEL_W
+    check("主窗口贴【所在屏】的右边缘", ok_r,
+          f"rect={r}　屏={mon}" + ("" if ok_r else dump_geom(app.pid)))
+    ok_h = size == (PANEL_W, mon[3] - mon[1])
+    check("主窗口铺满【所在屏】的屏高", ok_h,
+          f"size={size}　屏={mon}" + ("" if ok_h else dump_geom(app.pid)))
 
     # 等 WebView 把界面画出来，否则 OCR 找不到按钮
     origin = (r[0], r[1])
@@ -862,6 +1146,8 @@ def run(app):
         time.sleep(0.5)
         check(f"{name} 已删除", not os.path.exists(path),
               "还在：" + path if os.path.exists(path) else "")
+
+    DONE[0] = True      # ← 跑到这里才算【整份跑完】。见 main() 里那段说明。
 
 
 def read_pipeline_lines():

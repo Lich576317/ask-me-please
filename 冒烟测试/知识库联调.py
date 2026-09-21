@@ -367,6 +367,46 @@ def t_phrase_excluded():
 
 
 # ══════════════════════════════════════════════════════════
+# 5c. 前缀认领对中文要收手（v0.20 · 决策 51 的第三处）
+# ══════════════════════════════════════════════════════════
+
+def t_claim_cjk():
+    print("\n▸ _claim 的前缀认领只对英文生效（中文不许被短词认领走）")
+    fresh_db()
+
+    # ⚠ 这段兜底是为【英文构词】写的：`Chunk` → `Chunking`（长度差 3）。
+    #   中文没有这种构词法，而 _TERM_SLACK 的「差 6」对 2~4 个字的中文词
+    #   等于放行一切。失控起来和 `Vector DB` 被认领成 `vector` 是同一个形状：
+    #   展示 term 被改写成短词、解释挂到短词的 key 上、再以短词的身份写进库 ——
+    #   下一轮短词命中知识库，永远贴出这条长词的解释。而且全程不报错。
+    pool = [{"term": "闭环思维", "key": kb.canon("闭环思维")},
+            {"term": "对齐颗粒度", "key": kb.canon("对齐颗粒度")}]
+
+    out = kb.attach_keys([{"term": "闭环思维模型", "explanation": "指…"}], pool)
+    check("★ 中文长词【不】被前缀更短的候选认领走（英文那条兜底不许外溢到中文）",
+          out[0]["term"] == "闭环思维模型" and out[0]["key"] != kb.canon("闭环思维"),
+          f'term={out[0]["term"]!r}　key={out[0]["key"]!r}'
+          f'（认领成 {kb.canon("闭环思维")!r} 就是把 5 个字的词改写成 4 个字的）')
+
+    out = kb.attach_keys([{"term": "对齐颗粒度模型", "explanation": "指…"}], pool)
+    check("★ 同上（换个词再来一次，防的是「碰巧这一个词是对的」）",
+          out[0]["term"] == "对齐颗粒度模型", out[0]["term"])
+
+    # ★ 反向：英文那条兜底【必须】原样活着。只钉中文不钉英文的话，
+    #   把整个兜底删掉也能全绿 —— 那就把 `Chunk` → `Chunking` 一起弄丢了。
+    out = kb.attach_keys([{"term": "Chunking", "explanation": "切块。"}],
+                         [{"term": "Chunk", "key": "chunk"}])
+    check("★ 反向：英文的拼写兜底照旧活着（Chunking 仍认领回 Chunk）",
+          out[0]["term"] == "Chunk" and out[0]["key"] == "chunk", out[0])
+
+    # ★ 反向之二：完全相同的词当然还认领得上（别把精确匹配也一起拦了）
+    pool3 = [{"term": "抓手", "key": kb.canon("抓手")}]
+    out = kb.attach_keys([{"term": "抓手", "explanation": "指…"}], pool3)
+    check("★ 反向：精确同名的中文候选照旧认领（拦的只是「前缀兜底」）",
+          out[0]["key"] == kb.canon("抓手"), out[0]["key"])
+
+
+# ══════════════════════════════════════════════════════════
 # 6. 写库 / 自动收录 / 收纳历史
 # ══════════════════════════════════════════════════════════
 
@@ -562,7 +602,7 @@ def main():
 
     try:
         for fn in (t_canon, t_policies, t_excluded, t_seam, t_attach,
-                   t_phrase, t_phrase_excluded,
+                   t_phrase, t_phrase_excluded, t_claim_cjk,
                    t_write, t_export, t_single_source):
             fn()
     finally:
