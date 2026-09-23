@@ -233,7 +233,8 @@ class Api:
         self._last_todo = {"region": None, "clip": None}
 
         # ⚠ 自动通道来了之后 recognize() 就【真的会】并发了，这里有两处单槽状态：
-        #     · _last_todo 是单槽 —— 两轮撞上，后到者覆盖，先到者的解释会认领错的 key
+        #     · _last_todo 在【同一个通道内】仍是单槽（v0.20 起按通道分槽，见上一条）——
+        #       同通道两轮撞上，后到者照样覆盖，先到者的解释会认领错的 key
         #     · SHOT_REGION 是【固定单一路径】—— ocr._lock 只护引擎不护文件，
         #       两张图互相覆盖，后到者会把先到者正在 OCR 的那张删掉
         #   所以 recognize() 全程持锁，把它变成原子的。
