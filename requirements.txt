@@ -1,0 +1,32 @@
+# ══════════════════════════════════════════════════════════════
+#  问了吗 · 运行依赖
+#
+#  本文件里的版本是【本机实测通过】的那一组：
+#      Windows 11 家庭中文版 + Python 3.14.7 + 150% 缩放
+#  抄自 `python -m pip list --format=freeze`，不是从文档里推的。
+#
+#  ⚠ Python 3.14 很新，不少包还没有对应 wheel —— 装之前先：
+#        pip install --dry-run -r requirements.txt
+#    国内网络建议加清华源：
+#        pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# ══════════════════════════════════════════════════════════════
+
+# ── 直接依赖（代码里 import 过的东西）─────────────────────────
+mss==10.2.0             # 截屏。区域图与全屏底图都从这里出
+pynput==1.8.2           # 全局快捷键 Ctrl+E
+pywebview==6.2.1        # 窗口壳。界面是 HTML/CSS，跑在 Win11 自带的 WebView2 上，不打包 Chromium
+pywin32==312            # Win32 四件事：摆窗口 / 剪贴板 / 窗口枚举 / DPAPI 加解密
+rapidocr==3.9.2         # OCR。全本地，笔记内容不外传
+requests==2.34.2        # 调 DeepSeek
+
+# ── rapidocr 自己会拉下来的那些，列在这儿是为了【钉住版本】──
+#    它们在 Python 3.14 上装不装得上，是本项目环境里最容易翻车的一环
+numpy==2.5.3
+onnxruntime==1.30.0
+opencv-python==5.0.0.93
+pillow==12.3.0
+
+# ⚠ 不在这里的两样，别顺手加回来：
+#   · pyautogui / pyperclip —— 早先取词用过，现在剪贴板走原生 `win32clipboard`，
+#     全仓已经一处都不 import 了（`grep -r "pyautogui\|pyperclip" app/` 为空）
+#   · winsdk —— Windows 自带 OCR 那条路已废弃（Python 3.14 上只有源码包，要编译，装不上）
