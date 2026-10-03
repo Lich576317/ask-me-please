@@ -309,7 +309,22 @@ def fg_exe():
         return ""
 
 
-class ScreenLocked(Exception):
+class Bail(Exception):
+    """「这一份没跑完」的**共同父类** —— 只拿来 `except`，不拿来 `raise`。
+
+    ★ 为什么要有个共同父类，而不是在每个脚本里多写一条 `except`：
+      四个脚本一共 6 个 `except BOX.ScreenLocked:`（AI 那份一个函数一个）。
+      靠人记得在每个点都补上新的那一种，**漏掉一个点的样子是
+      「大部分时候会好好收尾，偶尔崩成 traceback」** ——
+      而那正是这次要修的东西本身。
+      收成一个父类之后，加新出口只要动父类，6 个点自动全都认得。
+
+    ⚠ 这是本项目那句「同一个字段有几个调用点就是几个守卫目标」的同一件事，
+      只不过守的东西从「字段」换成了「异常类型」。
+    """
+
+
+class ScreenLocked(Bail):
     """此刻前台是锁屏界面，屏幕上的像素已经不是桌面了。
 
     ⚠ 它存在的唯一理由，是【让这一份被记成「没验」，而不是「坏了」】。
@@ -342,6 +357,67 @@ def lock_bail():
     print("     这不是产品坏了，是这一份【没跑完】：下面那些项等于没验。")
     print("     解锁后重跑这个脚本就行：")
     print(f"       python \"{os.path.abspath(sys.argv[0])}\"")
+
+
+class CursorStuck(Bail):
+    """光标摆不到位 —— 合成点击会落到别处，宁可停手。
+
+    ★ 2026-09-24 00:38~00:40 真踩到一次，形态是**机器级**的：
+      `win32api.SetCursorPos` 抛 `pywintypes.error: (0, 'SetCursorPos',
+      'No error message is available')`。当场查过的：
+
+        · 不是参数错 —— 同一个调用几分钟前好好的，之后又好好的
+        · 不是锁屏 —— 截屏拍到的是一张正常桌面（带任务栏、时钟 0:40），
+          而且 `screen_locked()` 说是没锁
+        · 不是权限 —— `OpenInputDesktop` 成功，线程桌面 = 输入桌面 = "Default"
+        · **同一时刻 `mouse_event(MOUSEEVENTF_ABSOLUTE)` 也是空转**
+          （它和 SetCursorPos 走的是同一条注入路径）—— 所以是**整条注入
+          通路**暂时不通，不是这一个 API 坏了
+        · `GetCursorPos` 一直正常 —— 只读不问事的那半边没事
+
+      大约两分钟后自己好了（python 和 PowerShell 两边都能摆了）。
+      当时前台窗口在探针之间换过好几个（DeepSeek Harness → Ghost →
+      CASCADIA_HOSTING_WINDOW_CLASS），所以最像**桌面被别人占着**。
+
+    ⚠ 它存在的理由和 `ScreenLocked` 一字不差：
+      **让这一份被记成「没验」，而不是「坏了」。**
+      从前这里没有出口，于是这么一次两分钟的抽风，代价是
+      **raw pywin32 traceback 把整份脚本当场打死** —— 后面那些条
+      一条都没跑，而回归读不到汇总行，会把这一份报成「❌ 通过 0」，
+      读起来像产品炸了。
+
+    ⚠⚠ 更该记一笔的是：**这个坑不是新坑，是项目里已经有过同款的那一个**
+      ——「`find_on_panel()` 返回 bool 拿去 `click_until` 会 TypeError
+      **带走整份脚本**」（见 CLAUDE.md）。同一种形状：
+      **一个共享小工具在一次偶发失败上抛了个没人接的异常，
+      赔上的是整份报告。** 修的是这一次，该记住的是这个形状。
+    """
+
+
+def cursor_bail():
+    """光标摆不动：打那句话，收工。
+
+    ⚠ 措辞里的「光标摆不动」是 `全部回归.py` 认这一种的子串
+      （常量 `CURSOR_STUCK`），改了这里就得改那里 —— 两处是同一份约定。
+    """
+    print("")
+    print("  ⚠ 光标摆不动 —— 机器这会儿不接受合成的鼠标位置。")
+    print("     这不是产品坏了，是这一份【没跑完】：下面那些项等于没验。")
+    print("     多半是桌面被别的会话/别的程序占着，过一两分钟自己会好。")
+    print("     等一会儿再重跑这个脚本就行：")
+    print(f"       python \"{os.path.abspath(sys.argv[0])}\"")
+
+
+def why_bail(e):
+    """把接到的 `Bail` 说成人话。四个脚本 6 个收尾点共用这一处措辞。
+
+    ⚠ 别把两种合成一句：锁屏要去解锁、光标摆不动要等一会儿，
+      用户要做的事完全不同。
+    """
+    if isinstance(e, CursorStuck):
+        cursor_bail()
+    else:
+        lock_bail()
 
 
 def screen_locked():
@@ -550,10 +626,54 @@ def activate(hwnd):
     time.sleep(0.3)
 
 
+# 摆不动光标时重试几次。⏱ 总时长要**明显短于**人盯着看会觉得「卡住了」，
+# 又要长到能盖过那种一两秒的抽风 —— 6×0.2s ≈ 1.2 秒。
+CURSOR_TRIES = 6
+CURSOR_GAP = 0.2
+
+
+def set_cursor(pos, tries=CURSOR_TRIES, gap=CURSOR_GAP):
+    """把光标摆到 pos。偶发失败重试，真摆不动就 `raise CursorStuck`。
+
+    ⚠ **必须写成函数，不能就地 `win32api.SetCursorPos(pos)`**：
+      那一下抛出来的 `pywintypes.error` 没人接，会把整份脚本打死
+      （2026-09-24 实测踩到，见 `CursorStuck`）。
+
+    ⚠ 只对**抛异常**重试，【不】检查「光标真的动了吗」。这不是省事：
+      `t_drag_guard()` 那条反向对照正是把 `SetCursorPos` 换成一个
+      **什么都不做、但也不报错**的桩（`lambda p: None`）。在这里加一句
+      「没动就算失败」，那条变体就会变成「桩没让断言红、先把脚本打死了」，
+      反向对照当场失效 —— **而它失效的样子是全绿。**
+
+    ⚠ 查 `win32api.SetCursorPos` 要**在调用这一刻**查（写成 `win32api.…`
+      而不是开头顶个 `_SetCursorPos = win32api.SetCursorPos`）——
+      上面那条变体换的就是这个模块属性，开头顶下来的话换不掉。
+    """
+    last = None
+    for i in range(tries):
+        try:
+            win32api.SetCursorPos(pos)
+            return
+        except Exception as e:                # noqa: BLE001 —— 见下面那句
+            # ⚠ 这里**故意**不挑异常类型。挑的话就得赌 pywin32 抛的是哪一种
+            #   （这次实测的 `error(0, ...)` 本身就不是个「标准」错误码），
+            #   赌错的样子是「换个环境就又变成 traceback 打死脚本」。
+            #   代价是：真把参数写错了也会被吃掉、重试 6 次才报 ——
+            #   但报出来的还是 `CursorStuck`，仍然指向「光标摆不动」，
+            #   而参数写错是**当场就能从坐标看出来**的那一类。
+            last = e
+            if i < tries - 1:
+                time.sleep(gap)
+    raise CursorStuck(
+        f"摆了 {tries} 次都摆不到 {list(pos)}（每次隔 {gap}s）。"
+        f"最后一次报的是：{last!r}"
+    )
+
+
 def click(pos):
     """点一下。用 win32 而不是 pyautogui —— 后者内部要过一层动画，
     落点会飘几个像素，框选那边一飘就对不上了。"""
-    win32api.SetCursorPos(pos)
+    set_cursor(pos)
     time.sleep(0.2)
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(0.06)
@@ -569,7 +689,7 @@ def wheel(pos, notches):
       不滚的话，这条断言会顶着「功能坏了」的名字红，实际只是它在屏幕外。
       （`grab()` 只能截到当前视口，`PrintWindow` 那条路本机没走通，别绕。）
     """
-    win32api.SetCursorPos(pos)
+    set_cursor(pos)
     time.sleep(0.1)
     for _ in range(abs(notches)):
         delta = 120 if notches > 0 else -120
@@ -778,7 +898,7 @@ def drag(p0, p1, steps=14):
       只有真的被挪走才会重设。所以它只会让「被干扰」的拖框变对，
       不会让正常的拖框变慢或变脆。
     """
-    win32api.SetCursorPos(p0)
+    set_cursor(p0)
     time.sleep(0.25)
 
     # ★ 给「手比程序快」准备的，不是给程序准备的。
@@ -791,17 +911,25 @@ def drag(p0, p1, steps=14):
         print(f"       ⚠ 光标没摆到 {list(p0)}（现在在 {list(cur)}）—— 重新摆回去。")
         print("         若这一行连着出现，说明有脚本之外的东西在动光标：")
         print("         多半是人手真的碰了鼠标，那就得重跑这一份。")
-        win32api.SetCursorPos(p0)
+        set_cursor(p0)
         time.sleep(0.1)
 
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-    time.sleep(0.15)
-    for i in range(1, steps + 1):
-        win32api.SetCursorPos((p0[0] + (p1[0] - p0[0]) * i // steps,
-                               p0[1] + (p1[1] - p0[1]) * i // steps))
-        time.sleep(0.03)
-    time.sleep(0.2)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    try:
+        time.sleep(0.15)
+        for i in range(1, steps + 1):
+            set_cursor((p0[0] + (p1[0] - p0[0]) * i // steps,
+                        p0[1] + (p1[1] - p0[1]) * i // steps))
+            time.sleep(0.03)
+        time.sleep(0.2)
+    finally:
+        # ★ 抬起这一下**必须**在 finally 里 —— 这不是防御性编程，是止血。
+        #   按下和抬起之间现在多了一个会抛异常的东西（`set_cursor` 的重试）。
+        #   它一抛，原来那句 LEFTUP 就走不到了，**左键在系统眼里一直是按着的**
+        #   —— 那已经不是「这一份没跑完」了：用户接下来在**自己**的电脑上
+        #   点一下，变成拖拽。测试脚本把人家的鼠标卡住，比测试失败严重得多。
+        #   同理适用于任何以后插进这一段、可能抛异常的调用。
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
     time.sleep(0.2)
 
 
@@ -980,6 +1108,112 @@ def t_drag_guard():
         win32api.SetCursorPos = real_set
         win32api.GetCursorPos = real_get
         win32api.mouse_event = real_evt
+
+
+def t_cursor_stuck_unit():
+    """★ 「光标摆不动」这条出口，真的跑一遍 —— 正反两面都要。
+
+    2026-09-24 加的（来由见 `CursorStuck`）。它要防的是：
+    一次两分钟的机器抽风，用 raw traceback 把整份脚本打死。
+
+    ⚠ 光验「它会抛 CursorStuck」是不够的 —— 那用一个**从不成功**的桩
+      就能骗过去。真正要验的是**「偶发」这两个字**：
+      中间失败一次、下一次成功，那才是实测到的形态（那两分钟里
+      python 和 PowerShell 两边都摆过、也都失败过）。
+      只有「一直失败」的桩的话，`set_cursor` 写成「第一次失败就抛」
+      照样全绿 —— 而那种写法在真实的偶发抽风下会把本来能跑的拖框全毙掉。
+
+    ⚠ 桩要打在 `win32api.SetCursorPos` 这个**模块属性**上，
+      因为 `set_cursor` 是**在调用那一刻**去查它的（不是开头顶下来一个引用）。
+      那条约定写在 `set_cursor` 的说明里，这里就是它的反向对照。
+    """
+    real = win32api.SetCursorPos
+    try:
+        # ① 一直是坏的：必须重试满 tries 次，然后抛 CursorStuck
+        n = {"c": 0}
+
+        def boom(p):
+            n["c"] += 1
+            # ⚠️ 故意用**真实那一串**的形状报错 —— 实测到的就是
+            #    `pywintypes.error: (0, 'SetCursorPos', 'No error message is available')`。
+            raise OSError(0, "SetCursorPos", "No error message is available")
+
+        win32api.SetCursorPos = boom
+        caught = None
+        try:
+            set_cursor((321, 654), tries=3, gap=0)
+        except CursorStuck as e:
+            caught = e
+        check("★ 光标摆不动：摆 3 次都失败 → 抛 CursorStuck（不是把 raw 异常漏出去）",
+              caught is not None,
+              f"抛出来的是 {type(caught).__name__ if caught else '没抛，直接返回了'}",
+              hint="没抛 CursorStuck 的话，这个异常会一路冒到 main() 外面，"
+                   "以 pywin32 traceback 收场 —— 正是要修的那个样子")
+        check("光标摆不动：真的重试了（不是试一次就放弃）",
+              n["c"] == 3, f"SetCursorPos 被调了 {n['c']} 次，期望 3 次")
+        check("光标摆不动：那句话里说了「摆了几次、最后报的是什么」",
+              caught is not None and "摆了 3 次" in str(caught)
+              and "321" in str(caught),
+              f"实际是：{caught!r}",
+              hint="只说「摆不动了」的话，看报告的人没法判断是参数写错了"
+                   "还是机器抽风 —— 这两件事的下一步完全不同")
+
+        # ② ★ 偶发：第一次失败、第二次成功 → 必须**照常返回**，且只试了两次。
+        #    这一条是这段代码存在的理由本身。
+        seq = {"c": 0}
+
+        def flaky(p):
+            seq["c"] += 1
+            if seq["c"] == 1:
+                raise OSError(0, "SetCursorPos", "No error message is available")
+
+        win32api.SetCursorPos = flaky
+        threw = None
+        try:
+            set_cursor((11, 22), tries=3, gap=0)
+        except CursorStuck as e:
+            threw = e
+        check("★★ 光标摆不动：偶发一次（第二次就好了）→ 不许抛，要照常往下走",
+              threw is None and seq["c"] == 2,
+              f"抛了 {threw!r}；SetCursorPos 试了 {seq['c']} 次",
+              hint="这里抛出去的话，本来能跑完的拖框会被一次瞬断整个毙掉 ——"
+                   "那比原来的 bug 还糟：原来至少是崩在明处")
+
+        # ③ 反着来：一次就成功 → 只调一次，别白白重试（健康路径不许变慢）
+        ok = {"c": 0}
+
+        def fine(p):
+            ok["c"] += 1
+
+        win32api.SetCursorPos = fine
+        threw2 = None
+        try:
+            set_cursor((7, 8), tries=6, gap=0.5)
+        except CursorStuck as e:
+            threw2 = e
+        check("光标摆不动：反向对照 —— 一次就成功时【不重试、不等待】",
+              threw2 is None and ok["c"] == 1,
+              f"抛了 {threw2!r}；试了 {ok['c']} 次",
+              hint="调了多次的话，健康路径上每次点击都要多花几百毫秒 ——"
+                   "整个回归会莫名其妙变慢，而且没人看得出是这儿慢的")
+
+        # ④ `cursor_bail()` 打的字里必须有那个约定子串（`全部回归.py` 认它）。
+        #    ⚠ 这一条【只在两个文件都对得上时才绿】——
+        #      所以它同时钉住了「改了 `框选联调.py` 忘了改 `全部回归.py`」。
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cursor_bail()
+        said = buf.getvalue()
+        check("光标摆不动：收尾那句话里带着约好的子串（回归靠它认「没跑完」）",
+              "光标摆不动" in said, f"实际打了：{said.strip()[:100]!r}",
+              hint="少了这几个字，回归读不出这是「没跑完」，"
+                   "会把它记成「❌ 通过 0 项」—— 看着像产品炸了")
+        check("光标摆不动：收尾那句话里【不许】混进锁屏那句文案",
+              "屏幕现在是【锁着的】" not in said,
+              hint="混进去的话会被回归的锁屏分支抢走，"
+                   "用户会被支使去解锁 —— 而解锁对这件事没用")
+    finally:
+        win32api.SetCursorPos = real
 
 
 def t_click_until_unit():
@@ -1196,6 +1430,10 @@ def main():
     print("\n⓪ 从没执行过的分支（先跑掉）")
     t_confirm_lock()
     t_drag_guard()
+    # ⚠️ 这条也要排在 `require_clean_screen()` 之后：它一样是「不需要窗口，
+    #    但需要一份还没开跑的报告」—— 摆到前面的话，锁屏那几轮里
+    #    它跑过了、而报告说的是「整段没跑」，报的就不是实话。
+    t_cursor_stuck_unit()
     # ⚠️ 这两条都要排在 `require_clean_screen()` 【之后】——
     #    `t_stray_guard` 会**故意**摆一个不干净的屏幕出来，
     #    摆在开局自查前面的话，那份自查就永远是红的了。
@@ -1250,11 +1488,13 @@ def main():
     interrupted = False
     try:
         run(app)
-    except ScreenLocked:
+    except Bail as e:
         # 开局 `require_clean_screen()` 已经查过一次没锁 —— 所以走到这里，
         # 一定是【跑到一半才锁的】。
+        # ⚠ 收的是父类 `Bail`，不是 `ScreenLocked` —— 见 `Bail` 那段：
+        #   以后再加「没跑完」的新出口，这里和另外 5 个点都不用再改。
         interrupted = True
-        lock_bail()
+        why_bail(e)
     finally:
         for p in (note, app):
             subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],

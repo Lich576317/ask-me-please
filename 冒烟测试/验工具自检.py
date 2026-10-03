@@ -193,8 +193,20 @@ def _run_reg_selfcheck(mod):
       所以这里单独把两种格式分开认。
     """
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = mod.selfcheck()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = mod.selfcheck()
+    except Exception as e:                # noqa: BLE001
+        # ★ 2026-09-24 加。**「崩了」和「红了」必须分得开**：
+        #   `probe_reg` 期望的结果就是「红」，所以一个崩掉的变体
+        #   如果被记成「红了」，这条链会**假装自己是好的**。
+        #   实测过一次真的：`selfcheck()` 里新加了一条要读兄弟文件的断言，
+        #   变体目录里没有那个文件 → FileNotFoundError。
+        #   原来这个异常会一路冒穿 `probe_reg`，把整份自检崩成一个 traceback
+        #   —— 至少是响的；但读报告的人看到的是「验工具自检 崩了」，
+        #   而不是「B 组第几条没得出结果」。
+        print(f"      （变体抛异常，没跑出结论：{type(e).__name__}: {e}）")
+        return -1, -1
     m = re.search(r"([❌✅]) (\d+)/(\d+)", buf.getvalue())
     if not m:
         return -1, -1                     # 压根没报数 —— 本身就是缺陷
@@ -287,6 +299,17 @@ def probe_reg(load_fn, label, want_red=True):
         if mod is None:
             print(f"  ✗ {label:<28} → 造不出这个变体（源码结构变了？）")
             return False
+        # ★ 变体被复制到 tmp 去跑，而 `全部回归.selfcheck()` 里有一条
+        #   **跨文件**的断言（`CURSOR_STUCK` 那句约定），要按 `HERE` 去找
+        #   兄弟文件 `框选联调.py` —— tmp 里没有，于是整个自检崩在
+        #   FileNotFoundError 上，而不是照常报「红了 N 条」。
+        #   这里给它指回**真仓库**那一份：变体验的是 `全部回归.py` 的
+        #   判断逻辑，兄弟文件本来就该用真的。
+        #   ⚠️ 少了这一行，`probe_reg` 会因为**读不到文件**而红 ——
+        #      而「红了」正是它期望的结果，于是**这条链会假装自己是好的**。
+        #      所以下面 `_run_reg_selfcheck` 才会对「压根没报数」单独返回
+        #      `(-1, -1)`：崩掉和报红必须分得开。
+        mod.SIBLING_DIR = HERE
         n_bad, n_all = _run_reg_selfcheck(mod)
         if n_bad is None:
             print(f"  ✗ {label:<28} → 报的数和退出码对不上，这本身是个缺陷")

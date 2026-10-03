@@ -198,6 +198,73 @@ def save_settings(data):
     os.replace(tmp, path)          # 原子：要么旧的、要么新的，没有中间态
 
 
+def _tk_run(src, timeout=180):
+    """跑一个**短命子进程**（tkinter 选择框），把它打印出来的路径收回来。
+
+    返回 `{"ok", "path", "cancelled", "msg", "detail"}`：
+      · 正常退出但一个字都没打 → `cancelled`（用户在框里按了取消）
+      · 超时 / 非零退出 / 根本起不来 → `ok=False`，`msg` 里说人话
+
+    ★ **抽成模块级函数的唯一理由：这段是整条选择框链路上最容易静默出错的地方。**
+      下面 `encoding` / `PYTHONUTF8` 少写任何一个，中文路径回来就是乱码 ——
+      **不报错**，只是路径变成一个不存在的目录，用户看到的是「找不到文件」。
+      抽出来之后 `知识库联调.py` 能拿一个**真子进程**把它钉住（不用起窗口）。
+      ⚠ 别为了「反正只有两个调用点」把它塞回 `Api` 里去 —— 塞回去它就没法测了。
+    """
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", src],
+            capture_output=True, text=True,
+            # ⚠ 两个都要：encoding 管父进程怎么解码，
+            #   PYTHONUTF8 管子进程自己怎么写 stdout。
+            #   少一个，中文路径回来就是乱码（和本文件开头 reconfigure 同一个坑）。
+            encoding="utf-8", errors="replace", timeout=timeout,
+            env={**os.environ, "PYTHONUTF8": "1"},
+        )
+    except subprocess.TimeoutExpired:
+        # ⚠ 秒数是照着入参算出来的，不许写死。
+        #   （本项目真栽过：一句错误文案把「15 秒」写死，而实际等的是 3 秒 ——
+        #   错误文案的读者正是最需要它说真话的那个人。）
+        return {"ok": False, "msg": f"对话框等了 {timeout} 秒没动静，已放弃"}
+    except Exception as e:
+        return {"ok": False, "msg": "打不开选择框", "detail": str(e)}
+
+    if r.returncode != 0:
+        return {"ok": False, "msg": "选择框自己出错了",
+                "detail": (r.stderr or "")[-300:]}
+
+    path = (r.stdout or "").strip()
+    if not path:
+        return {"ok": True, "cancelled": True, "path": ""}
+    return {"ok": True, "cancelled": False, "path": path}
+
+
+def _import_log_line(path, r):
+    """把一次导入的结果拼成**一行**日志。
+
+    ★ 抽成模块级函数的理由和 `_tk_run` 同一个：**这段里少一个数，没人会知道。**
+      `kb.import_md` 把 `dupes` 算出来了（它的注释白纸黑字：「要【数出来】告诉用户」），
+      界面也显示（`app.js` 的 `importMsg`）—— 可这行日志一开始漏了它。
+      漏了不报错、不少一条数据，只是**看日志的人永远不知道文件里有重复**。
+      用户拍板的口径是「直接导 + **详细报数**」，少报一个数就是没做到那句话。
+      抽出来之后 `知识库联调.py` 能直接拿一个字典钉住它（不用起窗口、不用真导入）。
+
+    ⚠ `dupes` / `backup` 是**有条件才打**的：
+      没有重复时打「重复 0」、没备份时打「备份 -> None」都是噪音，
+      看日志的人得先学会忽略它们 —— 那还不如不打。
+    """
+    line = (f"[知识库] 导入 {path}：读进 {r['total']} 行　新增 {r['added']}　"
+            f"覆盖 {r['updated']}　未变 {r['unchanged']}　跳过 {r['skipped']}　"
+            f"坏行 {r['bad']}")
+    if r.get("dupes"):
+        line += f"　文件内重复 {r['dupes']}（后面的赢）"
+    if r.get("backup"):
+        line += f"　备份 -> {r['backup']}"
+    return line
+
+
 class Api:
     """暴露给前端的接口。JS 侧通过 window.pywebview.api.xxx() 调用。"""
 
@@ -509,7 +576,36 @@ class Api:
         改成另起一个短命子进程跑 tkinter：它有自己主线程和自己的消息循环，
         和 WebView2 完全不共享 GUI 线程，卡死了也能 kill 掉。
         """
-        import subprocess
+        r = self._tk_pick("dir")
+        if not r["ok"]:
+            return r
+        if r["cancelled"]:
+            return {"ok": True, "cancelled": True,
+                    "dir": self.settings.get("kb_dir") or kb.default_dir()}
+        self.settings["kb_dir"] = r["path"]
+        save_settings(self.settings)
+        return {"ok": True, "dir": r["path"]}
+
+    def _tk_pick(self, what):
+        """弹一个 Tk 选择框，返回 {"ok", "path", "cancelled", "msg", "detail"}。
+
+        what: "dir" 选目录 | "file" 选文件。
+
+        ⚠ **选目录和选文件共用这一份**（v0.31 抽出来的）。理由都在 `kb_choose_dir`
+          的 docstring 里（工作线程没包 Invoke / COM 要 STA / HOMEPATH 没盘符），
+          而那三条对「选文件」一条不多一条不少 —— 同一个 pywebview 函数。
+          子进程那一段（含 `encoding` / `PYTHONUTF8` 两个必须同时给的参数）
+          在模块级的 `_tk_run` 里，**也有且只有一份** —— 各写一遍的话，
+          哪天有人把中文路径那个坑修在一条上，另一条照样乱码，
+          而且不报错，只是选回来的路径变成乱码，用户看到的是「找不到文件」。
+
+        本函数现在只剩一件事：**决定弹哪个框**。
+        """
+        if what == "file":
+            call = ("filedialog.askopenfilename(title='选择要导入的 md 文件',"
+                    " filetypes=[('Markdown', '*.md'), ('所有文件', '*.*')])")
+        else:
+            call = "filedialog.askdirectory(title='选择导出目录', mustexist=False)"
 
         src = (
             "import tkinter as tk\n"
@@ -519,37 +615,50 @@ class Api:
             # 面板是置顶无边框的，Tk 窗口不置顶的话会被自己的面板压住 ——
             # 症状是「点了选择，什么都没发生」
             "root.attributes('-topmost', True)\n"
-            "p = filedialog.askdirectory(title='选择导出目录', mustexist=False)\n"
+            + "p = " + call + "\n" +
             "root.destroy()\n"
             "print(p or '')\n"
         )
-        try:
-            r = subprocess.run(
-                [sys.executable, "-c", src],
-                capture_output=True, text=True,
-                # ⚠ 两个都要：encoding 管父进程怎么解码，
-                #   PYTHONUTF8 管子进程自己怎么写 stdout。
-                #   少一个，中文路径回来就是乱码（和 main.py 开头 reconfigure 同一个坑）。
-                encoding="utf-8", errors="replace", timeout=180,
-                env={**os.environ, "PYTHONUTF8": "1"},
-            )
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "msg": "对话框等了 3 分钟没动静，已放弃"}
-        except Exception as e:
-            return {"ok": False, "msg": "打不开选择框", "detail": str(e)}
+        return _tk_run(src)
 
-        if r.returncode != 0:
-            return {"ok": False, "msg": "选择框自己出错了",
-                    "detail": (r.stderr or "")[-300:]}
+    # ══════════ 导入自定义知识库（v0.31） ══════════
+    def kb_choose_file(self):
+        """选一个要导入的 md —— **只选，不导**。
 
-        path = (r.stdout or "").strip()
+        ⚠ 选和导分成两次调用，是为了让「选错了」和「导错了」是两句不同的话。
+          合成一跳的话，用户点了导入、选框弹出来、他改了主意按取消 ——
+          前端只能收到一个「什么也没发生」，分不清是取消还是失败。
+        """
+        r = self._tk_pick("file")
+        if r["ok"] and not r["cancelled"]:
+            return {"ok": True, "path": r["path"]}
+        return r
+
+    def kb_import(self, path):
+        """把一份两栏 md 导进库。
+
+        ⚠ 冲突口径（**用户 2026-09-23 拍板**）：**导入的赢**，
+          被覆盖的旧值先另存一份能再导回来的备份 —— 全在 `kb.import_md` 里，
+          这里只负责转达和打日志。
+        """
+        path = (path or "").strip()
         if not path:
-            return {"ok": True, "cancelled": True,
-                    "dir": self.settings.get("kb_dir") or kb.default_dir()}
+            return {"ok": False, "msg": "没给文件路径"}
+        if not os.path.exists(path):
+            return {"ok": False, "msg": f"找不到这个文件：{path}"}
 
-        self.settings["kb_dir"] = path
-        save_settings(self.settings)
-        return {"ok": True, "dir": path}
+        out_dir = self.settings.get("kb_dir") or kb.default_dir()
+        r = kb.import_md(path, out_dir)
+        if r.get("ok"):
+            # 一行打完 —— 这几条数就是「到底动了什么」的全部记录，
+            # 少打一个，读的人就得去猜（界面上的文案也是照着这几个数拼的）。
+            # ⚠ 内容住在 `_import_log_line` 里，改它之前先看那段注释：
+            #   它被 `知识库联调.py` 钉着，且 `dupes` 曾经就在这里被漏掉过。
+            print(_import_log_line(path, r), flush=True)
+        else:
+            print(f"[知识库] 导入失败：{r.get('msg')}　{r.get('detail','')}", flush=True)
+        r["kb"] = kb.stats()
+        return r
 
     def dismiss_notice(self):
         self.settings["seen_notice"] = True
@@ -1215,6 +1324,19 @@ def main():
         width=PANEL_W,
         height=900,
         x=0, y=0,
+        # ★★ 2026-09-24 加，别删。pywebview 的默认值是 `(200, 100)`，
+        #    而它会被乘上缩放比写进 WinForms 的 `MinimumSize`
+        #    （`webview/platforms/winforms.py`：`MinimumSize = Size(
+        #     int(min_size[0] * scale), int(min_size[1] * scale))`）。
+        #    本机 150% → 下限 300×150 物理，于是**折叠永远摆不到位**：
+        #    实测每点一次折叠，日志里就多三行
+        #      [问了吗] 摆位对不上：想要 (…, 42)，实际 (…, 150)
+        #    `shell.COLLAPSED_H` 是「标题栏那么高」= 42 CSS = 63 物理，
+        #    比 150 矮，所以在此之前**折叠从来没到过它自称的高度**。
+        #    这里压到 40：乘上任何常见缩放（100%~200%）都落在
+        #    「标题栏高度」以下，留一点余量，不卡在边界上。
+        #    （探针实测：150% 下下限从 150 降到 63，正好等于标题栏。）
+        min_size=(200, 40),
     )
 
     webview.start(on_ready, sh)

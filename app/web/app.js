@@ -951,6 +951,20 @@
     if (el) el.textContent = t;
   }
 
+  /* 导入结果的报数（v0.31）。
+     ★ 跳过和坏行【必须分开说】，而且要各自带上为什么 ——
+       合起来报一个「13 条没进来」的话，用户会以为是我们把数据弄丢了。
+       它俩是两回事：跳过的是他自己排除过的词，坏行是他的文件那几行不对。
+     ⚠ 一个数为 0 就不提它 —— 满屏的「未变 0　跳过 0」会把真正要说的事淹掉。 */
+  function importMsg(r) {
+    let s = `已导入：新增 ${r.added}　覆盖 ${r.updated}　未变 ${r.unchanged}`;
+    if (r.skipped) s += `　跳过 ${r.skipped}（在排除名单里）`;
+    if (r.bad) s += `　⚠ ${r.bad} 行没读进来（不是严格两栏）`;
+    if (r.dupes) s += `　⚠ 文件里重复 ${r.dupes} 条，后面的赢了`;
+    if (r.backup) s += `　旧值已备份 → ${r.backup}`;
+    return s;
+  }
+
   function bindKB() {
     $('kb-policy').querySelectorAll('button').forEach((b) => {
       b.addEventListener('click', async () => {
@@ -987,10 +1001,27 @@
       $('kb-dir').value = r.dir;
     });
 
-    // ⚠ 只有导入还没接。文案不能再笼统说「骨架阶段」——
-    //   另外三个都接上了，那时候骨架早就不叫骨架了。
-    $('btn-import').addEventListener('click', () => {
-      kbMsg('导入自定义知识库排在下一版（导出格式已经为它留好了）');
+    /* ⚠ 选文件和导入是【两次调用】，不是一次。
+       合成一跳的话，「用户按了取消」和「导入失败」在前端就分不开，
+       只能都报成「什么也没发生」—— 而这两件事用户该做的事完全不同。
+       后端 kb_choose_file 的注释里说了同一件事。 */
+    $('btn-import').addEventListener('click', async () => {
+      kbMsg('正在打开选择框…');
+      const f = await api().kb_choose_file();
+      if (f.cancelled) { kbMsg('已取消'); return; }
+      if (!f.ok) {
+        kbMsg('打不开选择框：' + (f.msg || '') + (f.detail ? '　' + f.detail : ''));
+        return;
+      }
+      const r = await api().kb_import(f.path);
+      if (!r.ok) {
+        // ⚠ 失败时把 detail 也带上 —— 用户拿着「这份文件读不出来」
+        //   是没法自己修的，得知道是哪一行、为什么。
+        kbMsg(`导入失败：${r.msg}${r.detail ? '　' + r.detail : ''}`);
+        return;
+      }
+      renderKb(r);
+      kbMsg(importMsg(r));
     });
   }
 

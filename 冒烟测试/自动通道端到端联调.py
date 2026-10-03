@@ -528,8 +528,8 @@ def main():
     note = BOX.start_note()
     time.sleep(2.0)
 
-    # ⚠ `rc` 必须先给个值：phase_one 里抛 ScreenLocked 的话，下面那两行
-    #   一行都没执行，finally 之后 `rc` 是【未绑定】—— 直接读它会 NameError。
+    # ⚠ `rc` 必须先给个值：phase_one 里抛 `Bail`（锁屏 / 光标摆不动）的话，
+    #   下面那两行一行都没执行，finally 之后 `rc` 是【未绑定】—— 读它会 NameError。
     rc = 1
     interrupted = False
     try:
@@ -540,11 +540,11 @@ def main():
             #   于是它半路 return 1 也照样打一份完整的汇总行。
             #   ★ 这和 `知识库端到端联调.py` ⑧ 那句 return 是同一个形状 ——
             #     v0.20 的回归里它吞掉了 45 项。这里一并收口。
-    except BOX.ScreenLocked:
+    except BOX.Bail as e:
         # 开局 `require_clean_screen()` 已经查过一次没锁 —— 所以走到这里，
-        # 一定是【跑到一半才锁的】。措辞在 `BOX.lock_bail()` 里，四个脚本共用。
+        # 一定是【跑到一半才锁的】。措辞在 `BOX.why_bail()` 里，四个脚本共用。
         interrupted = True
-        BOX.lock_bail()
+        BOX.why_bail(e)
     finally:
         kill(note)
         srv.shutdown()

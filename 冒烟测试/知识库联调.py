@@ -15,6 +15,7 @@
 import os
 import re
 import sys
+import time
 import sqlite3
 import tempfile
 import shutil
@@ -491,40 +492,17 @@ def t_write():
 
 
 # ══════════════════════════════════════════════════════════
-# 7. 导出 md
+# 7. 导出 / 导入 md
 # ══════════════════════════════════════════════════════════
 
-def split_md_row(ln):
-    """把一行 md 表格拆成格子，处理转义。
-
-    ⚠ 首尾各有一个 `|`，直接切会多出两个【空】格子 ——
-      第一版就是栽在这儿的，四条断言一起红，看起来像导出坏了，
-      其实导出是对的、解析器是错的。"""
-    cells, cur, i = [], "", 0
-    body = ln.rstrip("\n")
-    while i < len(body):
-        ch = body[i]
-        if ch == "\\" and i + 1 < len(body):
-            cur += body[i + 1]; i += 2; continue
-        if ch == "|":
-            cells.append(cur); cur = ""; i += 1; continue
-        cur += ch; i += 1
-    cells.append(cur)
-    return [c.strip() for c in cells[1:-1]]      # 掐掉首尾竖线带来的空格子
-
-
-def parse_md(path):
-    """把自己导出的 md 读回来。下一版的「导入」就靠这个形状 ——
-    现在先钉住，免得到时候发现导出的格式根本读不回来。"""
-    out = []
-    with open(path, encoding="utf-8") as f:
-        for ln in f:
-            if not ln.startswith("| ") or ln.startswith("| ---"):
-                continue
-            cells = split_md_row(ln)
-            if len(cells) == 2 and cells[0] != "术语":
-                out.append(tuple(cells))
-    return out
+# ⚠ 这两个解析函数**不再有第二份实现**。
+#   以前它们只活在本文件里（导出那版就是照着它们写的），v0.31 的导入功能要复用，
+#   于是搬去了 app/kb.py —— 测试直接取那一份。
+#   再在本地抄一遍的话，两份迟早分叉，而且**测试全绿**：真实导入按另一套规则切列，
+#   本文件照样报「来回一圈条目数不变」。这正是本项目栽过的那个形状
+#   （aipm-job-assistant：构建期断言和运行时的读取函数各写各的）。
+split_md_row = kb.split_md_row
+parse_md = kb.parse_md
 
 
 def cols_of(ln):
@@ -555,15 +533,22 @@ def t_export():
     raw = open(r["path"], encoding="utf-8").read()
     check("文件是 UTF-8 无 BOM（Obsidian / 飞书都吃这个）",
           not raw.startswith("﻿"))
-    check("文件头写明了「这是快照，改了不会回库」",
-          "快照" in raw and "不会回到" in raw)
+    # ★ v0.31 起这句话反过来了：以前是「改了不会回库」，现在是「能导回来」。
+    #   导入落地当天不同时改它，这条断言就会一直绿着、把一句假话钉在那儿 ——
+    #   而「断言钉住一句假话」比没有断言更坏：下一个人看见它，会以为这里验过了。
+    # ⚠ 判据只取**注释行**，别拿整个文件去 `in` —— 解释正文里出现「导入」
+    #   两个字是完全可能的（假服务器那几句已经差点撞上），那时这条会白过。
+    head = "".join(ln for ln in raw.splitlines() if ln.startswith("<!--"))
+    check("文件头写明了「改了能用导入读回库」（v0.31 起，不再是只读快照）",
+          "导入" in head and "读回" in head and "不会回到" not in head,
+          head[:120] or "(一条注释行都没有)")
     body = [ln for ln in raw.splitlines() if ln.startswith("| ") and not ln.startswith("| ---")]
     check("严格两栏（多一列下一版的导入就没法按列对齐）",
           all(cols_of(ln) == 2 for ln in body), [cols_of(ln) for ln in body])
     check("竖线被转义了（没转义就会把列撑破）",
           "\\|" in raw, [ln for ln in body if "RAG" in ln])
 
-    back = parse_md(r["path"])
+    back, _rep = parse_md(r["path"])
     got = dict(back)
     check("含竖线的解释能被读回来（转义正确）",
           got.get("RAG") == "含竖线 | 和反斜杠 \\ 的解释", repr(got.get("RAG")))
@@ -579,8 +564,269 @@ def t_export():
     check("今日范围能导出", r3["ok"] and r3["count"] == 2, str(r3))
 
 
+def t_import():
+    """导入自定义知识库（v0.31）。
+
+    ★ 口径是**用户 2026-09-23 拍板**的：**导入的赢 + 旧值留底 + 直接导完报数**。
+      这一组断言就是那三句话的落地，改行为之前先来这儿看看当初为什么这么定。
+    """
+    print("\n▸ 导入 md")
+    d = fresh_db()
+
+    def expl_of(term, key):
+        hits = kb.filter_candidates([{"term": term, "key": key}], "dedupe")["kb_hits"]
+        return hits[0]["explanation"] if hits else None
+
+    def write(name, text, enc="utf-8"):
+        p = os.path.join(d, name)
+        with open(p, "wb") as f:
+            f.write(text.encode(enc))
+        return p
+
+    kb.record_entries([
+        {"term": "RAG", "key": "rag", "explanation": "库里的旧解释"},
+        {"term": "Chunking", "key": "chunking", "explanation": "库里的旧解释"},
+    ], "dedupe")
+
+    src = write("in.md",
+                "| 术语 | 解释 |\n"
+                "| --- | --- |\n"
+                "| RAG | 改过的解释 |\n"
+                "| Chunking | 库里的旧解释 |\n"
+                "| VectorDB | 新来的 |\n")
+    r = kb.import_md(src, d)
+    check("导入成功", r["ok"], str(r))
+    check("★ 新增 / 覆盖 / 未变 三个数各归各位",
+          (r["added"], r["updated"], r["unchanged"]) == (1, 1, 1), str(r))
+    check("★★ 撞上库里的词，【文件里的】赢 —— 这是这个功能的全部意思",
+          expl_of("RAG", "rag") == "改过的解释", repr(expl_of("RAG", "rag")))
+    check("库里没有的词真的进库了",
+          expl_of("VectorDB", "vectordb") == "新来的", repr(expl_of("VectorDB", "vectordb")))
+
+    with sqlite3.connect(kb.kb_path()) as c:
+        srcs = dict(c.execute("SELECT key, source FROM terms").fetchall())
+    check("★ 导进来的条目 source='import' —— 否则一次「收纳历史」会把它们冲掉",
+          srcs.get("rag") == "import" and srcs.get("vectordb") == "import", str(srcs))
+
+    # ── 旧值留底 ────────────────────────────────────────────
+    check("★ 覆盖前留了备份文件", bool(r["backup"]) and os.path.exists(r["backup"]),
+          str(r.get("backup")))
+    bak = open(r["backup"], encoding="utf-8").read()
+    check("备份里留的是【旧值】，不是覆盖后的新值",
+          "库里的旧解释" in bak and "改过的解释" not in bak, bak)
+    check("★ 备份自己就是一份能【再导入】的 md —— 捞回来不需要再做一个界面",
+          parse_md(r["backup"])[0] == [("RAG", "库里的旧解释")],
+          str(parse_md(r["backup"])[0]))
+    check("只备份【真被覆盖】的那些，不为一字不差的条目浪费位置",
+          "Chunking" not in bak, bak)
+
+    # ── 幂等：同一份文件导第二次 ────────────────────────────
+    r2 = kb.import_md(src, d)
+    check("★ 同一份文件导第二次：全部 unchanged，不再报「覆盖」",
+          (r2["added"], r2["updated"], r2["unchanged"]) == (0, 0, 3), str(r2))
+    check("★ 没有覆盖 → 也就不该再写备份（不然每导一次堆一个文件）",
+          r2["backup"] is None, str(r2.get("backup")))
+
+    # ── 坏行必须被【数出来】 ────────────────────────────────
+    bad_src = write("bad.md",
+                    "| 术语 | 解释 |\n"
+                    "| --- | --- |\n"
+                    "| 三列词 | 它的解释 | 多出来的一格 |\n"
+                    "| 空解释词 |  |\n"
+                    "| 好词 | 好解释 |\n")
+    r3 = kb.import_md(bad_src, d)
+    check("★ 坏行被数出来，而不是悄悄丢掉（丢掉的话用户以为是我们弄没的）",
+          r3["ok"] and r3["bad"] == 2 and r3["added"] == 1, str(r3))
+    check("坏行的【行号和原因】也带回来了，用户能照着去找",
+          len(r3["bad_rows"]) == 2 and r3["bad_rows"][0][0] == 3
+          and "列" in r3["bad_rows"][0][2], str(r3["bad_rows"]))
+
+    r4 = kb.import_md(write("plain.md", "这是一份普通笔记，里面根本没有表格。\n"), d)
+    check("★ 一行表格都没有 → 明确失败，不是「导入成功 0 条」",
+          r4["ok"] is False and "都没读到" in r4["msg"], str(r4))
+
+    # ── 编码：记事本默认是 GBK ──────────────────────────────
+    gbk_src = write("gbk.md",
+                    "| 术语 | 解释 |\n| --- | --- |\n| 中文黑话 | 圈内说法 |\n", enc="gbk")
+    r5 = kb.import_md(gbk_src, d)
+    check("★ 记事本存的 GBK 也读得进来，并且【说清用了哪个编码】",
+          r5["ok"] and r5["encoding"] == "gbk" and r5["added"] == 1, str(r5))
+
+    # ── 排除名单优先 ────────────────────────────────────────
+    kb.exclude("KPI")
+    r6 = kb.import_md(write("ex.md", "| 术语 | 解释 |\n| --- | --- |\n| KPI | 不进库 |\n"), d)
+    check("被排除的词导不进来，且算 skipped 而不是 added",
+          r6["ok"] and r6["added"] == 0 and r6["skipped"] == 1, str(r6))
+
+    # ── ★★ 备份写不出来 → 整件事不做 ────────────────────────
+    blocker = os.path.join(d, "blocker")
+    open(blocker, "w").close()               # 拿一个【文件】挡在目录位置上
+    src2 = write("in2.md", "| 术语 | 解释 |\n| --- | --- |\n| RAG | 又要改一次 |\n")
+    before = expl_of("RAG", "rag")
+    r7 = kb.import_md(src2, os.path.join(blocker, "sub"))
+    check("★★ 备份写不成时，整个导入不做 —— 不许背着他把旧解释抹了",
+          r7["ok"] is False and expl_of("RAG", "rag") == before, str(r7))
+
+    # ── 文件自己内部重复 ────────────────────────────────────
+    r8 = kb.import_md(write("dup.md",
+                            "| 术语 | 解释 |\n| --- | --- |\n"
+                            "| DupWord | 先来的 |\n| DupWord | 后来的 |\n"), d)
+    check("★ 同一份文件里重复的词：后一条赢，而且 dupes 要数出来",
+          r8["dupes"] == 1 and expl_of("DupWord", "dupword") == "后来的", str(r8))
+
+    # ── 转义（和导出的 _esc_cell 是一对） ───────────────────
+    kb.import_md(write("esc.md",
+                       "| 术语 | 解释 |\n| --- | --- |\n"
+                       "| EscWord | 含竖线 \\| 和反斜杠 \\\\ 的解释 |\n"), d)
+    check("导入侧也认转义，和导出侧对得上",
+          expl_of("EscWord", "escword") == "含竖线 | 和反斜杠 \\ 的解释",
+          repr(expl_of("EscWord", "escword")))
+
+    # ── ★★ 主用法整条走一遍 ─────────────────────────────────
+    # 决策 14 说的「导出 → 可编辑 → 将来要能再导回」，就是这一条。
+    fresh_db()
+    kb.record_entries([{"term": "RAG", "key": "rag", "explanation": "第一版"}], "dedupe")
+    e = kb.export_md("all", d)
+    edited = open(e["path"], encoding="utf-8").read().replace("第一版", "改好的第二版")
+    r10 = kb.import_md(write("edited.md", edited), d)
+    check("★★ 主用法：导出 → 在文件里改 → 导回，改的必须生效",
+          r10["ok"] and r10["updated"] == 1 and expl_of("RAG", "rag") == "改好的第二版",
+          str(r10))
+
+    # ══════════════════════════════════════════════════════
+    # 反向对照 —— 给上面三条 ★★ 配的变体
+    #
+    # `CLAUDE.md`：「新加一条断言跑绿不算数 —— 给它配的变体不红，它就是装饰品」。
+    # 下面三条各自造一个【功能坏成它要防的那个样子】的局面，证明对应判据够得着。
+    # ⚠ 全部摆在本函数最后 —— 它们会把库改得面目全非，前面那些断言依赖库的状态。
+    # ══════════════════════════════════════════════════════
+
+    # ── 变体一：给「文件里的赢」配的 ────────────────────────
+    #   `record_entries` 走的就是「库里赢」那条路（INSERT OR IGNORE）。
+    #   同一份数据喂给它，值【不会】变成后来那个 —— 于是那条判据必然为假。
+    #   这证明判据分得出「导入的赢」和「库里赢」两种口径，不是碰巧为真。
+    fresh_db()
+    kb.record_entries([{"term": "RAG", "key": "rag", "explanation": "库里的旧解释"}], "dedupe")
+    kb.record_entries([{"term": "RAG", "key": "rag", "explanation": "改过的解释"}], "dedupe")
+    check("★★ 反向对照：「库里赢」的实现下，那条判据确实为假（两种口径分得出来）",
+          expl_of("RAG", "rag") != "改过的解释", repr(expl_of("RAG", "rag")))
+
+    # ── 变体二：给「备份写不成 → 整个导入不做」配的 ──────────
+    #   桩掉 `_write_backup` 让它【谎报成功】（返回一个不存在的路径），
+    #   于是 import_md 会以为备份好了、接着把库改了 ——
+    #   那条判据（库里还是 before）必须因此为假。
+    #   ⚠ 如果它照样为真，说明那条判据根本没读库，是个装饰品。
+    _saved_wb = kb._write_backup
+    try:
+        kb._write_backup = lambda over, out_dir=None: (os.path.join(d, "假备份.md"), "")
+        before2 = expl_of("RAG", "rag")
+        rv = kb.import_md(src2, d)          # src2 要把 rag 改成「又要改一次」
+        check("★★ 反向对照：备份信号被桩掉后，「整个导入不做」判据确实变红（够得着）",
+              rv["ok"] is True and expl_of("RAG", "rag") != before2,
+              f"桩后 rv.ok={rv['ok']}　库里={expl_of('RAG', 'rag')!r}")
+    finally:
+        kb._write_backup = _saved_wb
+
+    # ── 变体三：给「坏行被数出来」配的 ──────────────────────
+    #   桩一个【静默丢行】的解析器（report 里的 bad 永远为空），
+    #   模拟「解析器悄悄跳过」那种坏法 —— `r["bad"]` 必须跟着变成 0，
+    #   证明那个数【确实来自解析器的 report】，不是 import_md 自己另算的。
+    _saved_pm = kb.parse_md
+    try:
+        def _silent(p):
+            rows, rep = _saved_pm(p)
+            return rows, {"encoding": rep["encoding"], "rows": len(rows), "bad": []}
+        kb.parse_md = _silent
+        rv2 = kb.import_md(bad_src, d)
+        check("★★ 反向对照：解析器一旦静默丢行，那个「坏行数」判据确实变红（够得着）",
+              rv2["bad"] == 0, str(rv2))
+    finally:
+        kb.parse_md = _saved_pm
+
+
 # ══════════════════════════════════════════════════════════
-# 8. 前后端归一化只能有一份
+# 8. 导入那一行日志报了几个数
+# ══════════════════════════════════════════════════════════
+
+def t_log_line():
+    """`main._import_log_line` —— 导入那一行日志里，到底报了几个数。
+
+    ★ 为什么值得单独钉：**这行漏过一个数，而且漏了整整一轮没人发现。**
+      `kb.import_md` 把 `dupes` 算出来了（注释里写着「要【数出来】告诉用户」），
+      界面也显示它（`app.js` 的 `importMsg`）—— 只有这行日志没有。
+      漏了不报错、不少数据，只是**看日志的人永远不知道文件里有重复**。
+      用户拍板的口径是「直接导 + **详细报数**」：少报一个就不是那句话了。
+
+    ⚠ 纯内存：吃一个字典、吐一个字符串，既不碰库也不起窗口。
+      （这也正是把它抽成模块级函数的理由 —— 见 main.py 里那段注释。）
+    """
+    print("\n▸ 导入那一行日志，报的数全不全")
+    import main          # 懒加载：本文件其余部分用不着它，而它会拉起 pywebview
+
+    # 每个字段给一个**互不相同**的数：重复了的话，「哪个数没打出来」
+    # 就分不清是漏了字段还是两个字段碰巧相等（那正是本项目栽过的那种）。
+    r = {"ok": True, "total": 11, "added": 3, "updated": 2, "unchanged": 4,
+         "skipped": 1, "bad": 1, "dupes": 5, "backup": r"D:\备份\旧值.md"}
+
+    # 判据写成一串「字段 + 它的标签」的整句，不是 `str(5) in line` ——
+    # 后者在一行全是数字的日志里会【碰巧为真】，那种判据是装饰品。
+    frags = ["读进 11", "新增 3", "覆盖 2", "未变 4", "跳过 1", "坏行 1",
+             "重复 5", r"D:\备份\旧值.md"]
+    line = main._import_log_line(r"D:\词表.md", r)
+    check("★ 日志那一行把每个数都带上了（含「文件内重复」这个曾经漏掉的）",
+          all(f in line for f in frags),
+          f"缺：{[f for f in frags if f not in line]}　整行：{line}")
+
+    # 没有重复 / 没有备份时不许打「重复 0」「备份 -> None」——
+    # 那种行看久了，读的人会先学会忽略这几段，然后连有值的那次也一起忽略。
+    quiet = main._import_log_line("x.md", {**r, "dupes": 0, "backup": None})
+    check("没有重复、也没有备份时，那两段【一个字都不打】（不是打「重复 0」）",
+          "重复" not in quiet and "备份" not in quiet, quiet)
+
+    # ── 反向对照：给上面第一条判据配的 ──────────────────────
+    #   桩一个【改回没补 dupes 之前】的版本。它必须让那条判据变假 ——
+    #   否则说明那条判据根本没在读「重复」这一项，补了也白补。
+    #   ⚠ 桩的是**同一个形状**（吃 (path, r) 吐字符串），不然验的是别的东西。
+    def _漏了重复的旧版本(path, r):
+        return (f"[知识库] 导入 {path}：读进 {r['total']} 行　新增 {r['added']}　"
+                f"覆盖 {r['updated']}　未变 {r['unchanged']}　"
+                f"跳过 {r['skipped']}　坏行 {r['bad']}")
+
+    old_line = _漏了重复的旧版本(r"D:\词表.md", r)
+    check("★★ 反向对照：漏掉「重复」的旧版本下，那条判据确实为假（够得着）",
+          not all(f in old_line for f in frags), old_line)
+
+    # ── 还有一件事：它得【真的被调用】────────────────────────
+    #   ⚠ 上面那两条验的是这个函数「写得对不对」。
+    #     要是 `kb_import` 里头还留着原来那段自己拼字符串的 print，
+    #     那上面两条就是在验一段**没人调用的死代码** —— 全绿，而日志照旧漏。
+    #     （本项目栽过同款：闸门抽出来了，调用点没换过去。）
+    #   所以这里扫一眼源码，钉住「调用点真的换成它了」。
+    src = open(os.path.join(APP, "main.py"), encoding="utf-8").read()
+
+    def _还在自己拼(s):
+        """`kb_import` 里还有没有一段**手写并直接 print** 的「导入 … 读进 …」。
+
+        ⚠ 判据必须带上 `print(f"` —— 只找 `"[知识库] 导入 {path}"` 的话，
+          **`_import_log_line` 自己的函数体就长那样**，于是这条会永远为真、
+          永远报红（写这条时当场栽过一次：函数抽出来了，判据却说它没抽）。
+          要认的是**「谁在拼」**（调用点 vs 定义处），不是那段字本身。
+        """
+        return 'print(f"[知识库] 导入 {path}' in s
+
+    check("★ kb_import 真的改调 `_import_log_line` 了（不是抽出来摆着没人用）",
+          "_import_log_line(path, r)" in src and not _还在自己拼(src),
+          f"有调用={'_import_log_line(path, r)' in src}　"
+          f"还留着旧的自己拼={_还在自己拼(src)}")
+
+    check("★★ 反向对照：旧写法（自己拼那一大串）确实会让上面那条判据变红",
+          _还在自己拼(
+              'print(f"[知识库] 导入 {path}：读进 {r[\'total\']} 行…", flush=True)'),
+          "拿旧写法当样本，那条判据居然还是绿的")
+
+
+# ══════════════════════════════════════════════════════════
+# 9. 前后端归一化只能有一份
 # ══════════════════════════════════════════════════════════
 
 def t_single_source():
@@ -601,15 +847,110 @@ def t_single_source():
     check("默认提示词仍然只在后端一份", "DEFAULT_PROMPT" in r1)
 
 
+# ══════════════════════════════════════════════════════════
+# 10. 选择框那条子进程链路（v0.31）
+# ══════════════════════════════════════════════════════════
+
+def t_picker():
+    """`main._tk_run` —— 选择框链路上**唯一会静默出错**的那一段。
+
+    ⚠ 这里**不弹框**：要弹的那个框（`filedialog.askopenfilename`）得人拿鼠标点，
+      自动化点不了 —— 见文件末尾「未覆盖」。
+      但「子进程跑起来 → 它的 stdout 怎么变成路径」这一跳**能测**，
+      而它正是本项目真栽过的那类坑：中文路径变乱码，**不报错**，
+      只是路径变成一个不存在的目录，用户看到的是「找不到文件」。
+    ⚠ 用的是**真子进程**，不是把那段 `subprocess.run` 抄一遍再来测 ——
+      抄一遍的话，被测的是抄件，真件照样可以是坏的
+      （同「构建期断言必须照抄运行时读取函数」）。
+    """
+    print("\n▸ 选择框的子进程链路（不弹框）")
+    import subprocess
+    import main          # 懒加载：本文件其余部分用不着它，而它会拉起 pywebview
+
+    # 路径照抄用户自己的家目录形状（含全角括号）。⚠ 别换成一个「干净」的 ASCII 路径 ——
+    # 那样两个编码参数少给一个也照样绿，这条断言就成了装饰品。
+    cand = os.path.join(ROOT, "冒烟测试", "_选择框往返用的中文路径.md")
+    open(cand, "w", encoding="utf-8").close()
+    try:
+        got = main._tk_run(f"print({cand!r})")
+        # 判据是【两件事一起】：值相等，且这个路径真的能打开。
+        # 只看值的话，「一串恰好长得像路径的东西」也算过。
+        check("★ 中文路径（含全角括号）原样收回来，而且真能打开",
+              got.get("path") == cand and os.path.exists(got.get("path") or ""),
+              f"期望 {cand!r}　实到 {got.get('path')!r}"
+              " —— 对不上就是 encoding / PYTHONUTF8 少给了一个")
+
+        # ── 用户按了取消：子进程正常退出、一个字都没打 ──
+        #    `cancelled` 必须和 `ok=False` 分得开：前者是「他改了主意」，
+        #    后者是「框坏了」。合成一个的话，前端只能说一句「什么也没发生」。
+        c = main._tk_run("print('')")
+        check("取消（子进程没打路径）→ cancelled，不是「失败」",
+              c.get("ok") is True and c.get("cancelled") is True
+              and c.get("path") == "", str(c))
+
+        # ── 框自己崩了：非零退出 ──
+        e = main._tk_run("import sys; sys.stderr.write('子进程的遗言'); sys.exit(3)")
+        check("框自己崩了 → ok=False，而且 detail 装的是【子进程的 stderr】",
+              e.get("ok") is False and "子进程的遗言" in (e.get("detail") or ""),
+              str(e))
+
+        # ── 超时 ──
+        #   ★ 这几行正是「变体的价值不只是证明新代码会跑」那条老教训：
+        #     它跑起来之后才第一次看清**那句只在超时才打的话**说了什么。
+        #     文案里的秒数必须【跟着入参走】—— 写死成「3 分钟」的话，
+        #     一个 1 秒的超时也这么说，而错误文案的读者正是最需要它说真话的那个人。
+        t0 = time.time()
+        t = main._tk_run("import time; time.sleep(20)", timeout=1)
+        spent = time.time() - t0
+        check("超时 → ok=False，而且那句文案里的秒数【跟着入参】走",
+              t.get("ok") is False and "1 秒" in (t.get("msg") or ""), str(t))
+        check("超时是真的生效了（1 秒的入参没让它等到 180 秒）",
+              spent < 10, f"实际等了 {spent:.1f} 秒")
+
+        # ── 反向对照：给上面那条「中文路径原样收回来」配的变体 ──
+        #   别的都不动，**只把 PYTHONUTF8 拿掉**，同一条路径必须因此收不回来。
+        #   这条证明那个判据真的在盯这个参数，而不是「反正都一样」。
+        # ★★ 这条反向对照【必须每次都跑】，不许再写成「够不着就跳过」。
+        #
+        #   原来它是「问一句本机子进程默认编码是什么，已经是 utf-8 就跳过」，
+        #   结果**这个数跟着『谁把我拉起来的』变**：
+        #     从 Git Bash 跑 → 子进程默认 gbk → 这条跑 → 112 项
+        #     从 PowerShell 跑 → 它会把控制台代码页设成 UTF-8，子进程默认跟着变
+        #                       → 这条跳过 → 111 项
+        #   `全部回归.py` 那张表里写着一个**固定**的期望项数，
+        #   项数随启动方式漂移 = 那张对账表怎么填都是错的
+        #   （而且会伪装成「产品坏了」或「脚本少跑了」，两种都是假的）。
+        #
+        #   所以不再问「本机默认是什么」，而是**直接把局面造出来**：
+        #   这条要证明的是「子进程一旦吐出非 UTF-8，这条路径就收不回来」，
+        #   那就把子进程按成 gbk，让它必然吐非 UTF-8。
+        #   （`PYTHONIOENCODING` 是管 stdout 编码的正规开关，
+        #     不是绕开被测代码的后门 —— 被测的 `_tk_run` 那边压根没用到它。）
+        no_utf8 = {k: v for k, v in os.environ.items() if k != "PYTHONUTF8"}
+        no_utf8["PYTHONIOENCODING"] = "gbk"
+        broken = subprocess.run(
+            [sys.executable, "-c", f"print({cand!r})"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=no_utf8).stdout.strip()
+        check("★★ 反向对照：子进程一旦吐出非 UTF-8（这里按成 gbk），"
+              "同一条中文路径就收不回来 —— 「原样收回来」那条判据够得着",
+              broken != cand, f"吐了 gbk 居然还是 {broken!r}")
+    finally:
+        os.remove(cand)
+
+
 def main():
     print("═" * 52)
     print("③ 知识库联调")
     print("═" * 52)
 
-    # ★ 先验尺子。本文件的 `check()` 是它全部 80 项断言的唯一出口 ——
-    #   它要是坏成了「无条件记通过」，80 项会一起变绿，**而且项数对账
-    #   照样通过**（实到 80 = 期望 80）。这是本项目唯一一种
+    # ★ 先验尺子。本文件的 `check()` 是它全部断言的唯一出口 ——
+    #   它要是坏成了「无条件记通过」，本文件会【整片】变绿，**而且项数对账
+    #   照样通过**（实到 = 期望，两边一起错）。这是本项目唯一一种
     #   「没有任何别的机制兜得住」的坏法。
+    # ⚠️ 这里原来写的是「全部 80 项」，后来长到 103 —— **数字会长，别在这儿写死**。
+    #    要现数就现跑一遍，看结尾那行「通过 N 项」（这也是给上面那句
+    #    「断言钉住一句假话比没有断言更坏」做的示范）。
     # ⚠️ 摆在 try 之外 —— 守门的东西不能和被守的代码套在同一个 try 里。
     if not 尺子.gate(check, *尺子.list_snapshot(PASS, FAIL), label="知识库联调"):
         return 2
@@ -617,7 +958,8 @@ def main():
     try:
         for fn in (t_canon, t_policies, t_excluded, t_seam, t_attach,
                    t_phrase, t_phrase_excluded, t_claim_cjk,
-                   t_write, t_export, t_single_source):
+                   t_write, t_export, t_import, t_log_line,
+                   t_single_source, t_picker):
             fn()
     finally:
         kb.close()
@@ -637,7 +979,13 @@ def main():
 
 未覆盖（要等端到端脚本或真机）：
   · 白名单模式 + 空库 的那句硬拦截（在 main.Api 里，要起窗口才测得到）
-  · 右键菜单、撤销提示、导出目录选择框 这些界面行为
+  · 右键菜单、撤销提示 这些界面行为
+  · **「点了导入 → 弹出选框」那一跳本身** —— 它的自动化点不了：
+    `filedialog.askopenfilename` 是**模态**的，要人拿鼠标点，
+    没人点就一直等到超时。⚠ 所以 **导出目录选择框也一样没有被覆盖**
+    （端到端脚本是直接往 settings 里写 `kb_dir`，从没点过那个按钮）。
+    ★ 这里能钉住的只是子进程那一半（`t_picker`：跑起来 → stdout → 路径），
+    **不是「按钮 → 选框」那一跳本身** —— 别把它读成验过了。
 """)
     return 0
 

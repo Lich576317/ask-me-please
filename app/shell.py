@@ -32,7 +32,29 @@ TITLE = "问了吗"
 #   两道一起上：宽度够让它排得开，nowrap 保证即使不够也是被截、不是换行。
 PANEL_W = 520
 BAR_H = 320              # 上下停靠时的高度
-COLLAPSED_H = 42         # 折叠后只剩标题栏的高度
+
+# 折叠后「只剩一条标题栏」—— 这个数是【CSS 像素】，和 `.titlebar{height:42px}`
+# 对齐。**它不是最终的窗口高度**：窗口是物理像素，差一个缩放比。
+# 要高度一律走 `collapsed_h_for(hwnd)`，别直接拿这个常量去摆窗口。
+#
+# ★ 2026-09-24 修（C03 抓出来的）。原来这里写的是
+#     COLLAPSED_H = 42     # 折叠后只剩标题栏的高度
+#   而 `layout()` 把它**当物理像素**用 —— 同一个 42 有两层错：
+#     ① 本意是「标题栏那么高」，可 42 CSS 在 150% 下是 63 物理。
+#        42 物理比标题栏自己还矮，「展开」那个按钮会被切掉 ——
+#        折叠变成**单程票**，用户只能重启。（`跑50条.py` 的 C03_EXPAND
+#        防的就是这件事，它是目前唯一钉着这一条的断言。）
+#     ② 就算按物理算，窗口也有个**下限**：pywebview 默认
+#        `min_size=(200,100)`，乘 1.5 = 300×150 物理，写进 WinForms 的
+#        `MinimumSize`。实测（探针见 进展文档 附录 O）：150 以下一律摆不进去，
+#        SetWindowPos 之后回读还是 150。
+#   后果：折叠**从来没到过**它自称的高度，而且每点一次，app 日志里就多三行
+#     [问了吗] 摆位对不上（第 N 次）：想要 (…, 42)，实际 (…, 150)
+#   两处一起修：`main.py` 的 `create_window(min_size=(200,40))` 把下限
+#   压到 60 物理，这里再按当前 DPI 把高度算出来。
+#
+# ⚠ 这个常量此前**没有任何测试覆盖**（2026-09-24 全仓 grep 过「折叠」）。
+COLLAPSED_H = 42
 
 EDGES = ("right", "left", "top", "bottom")
 
@@ -43,6 +65,41 @@ def enable_dpi_awareness():
         ctypes.windll.shcore.SetProcessDpiAwareness(2)      # PER_MONITOR_AWARE_V2
     except Exception:
         ctypes.windll.user32.SetProcessDPIAware()
+
+
+def dpi_scale(hwnd):
+    """该窗口所在那块屏的缩放比（1.0 = 96 DPI）。
+
+    ⚠ **每次现取，不要缓存**：窗口可以在两块 DPI 不同的屏之间挪，
+      冻住的话换屏之后折叠/展开都会摆不到位。
+    ⚠ 和 `冒烟测试/跑50条.py` 的 `_scale()` 用的是**同一个 Win32 调用** ——
+      那边拿它算四个窗口按钮的坐标。两边算法分叉的话，测试会去点一个
+      空位置，而点空的样子是「按了没反应」，**看着像产品坏了**。
+    """
+    try:
+        dpi = int(ctypes.windll.user32.GetDpiForWindow(hwnd))
+    except Exception:
+        dpi = 96
+    # ⚠ **句柄无效时它返回 0，而不是抛异常**（2026-09-24 实测：
+    #   `GetDpiForWindow(0)` → 0）。只写 `except` 兜不住这一种 ——
+    #   0 / 96 = 0.0，于是 `collapsed_h_for()` 算出**高度 0**，
+    #   窗口被摆成一条零高度的缝，而且**不报错**。
+    #   「读不出来」必须退回默认值，不能凭空变出一个 0 来。
+    #   50%~500% 之外的读数一律当读失败（本机是 150%）。
+    if not (48 <= dpi <= 480):
+        dpi = 96
+    return dpi / 96.0
+
+
+def collapsed_h_for(hwnd):
+    """折叠后该有的窗口高度（**物理像素**）。
+
+    ★ 这是「折叠成多高」的**唯一实现处**：产品摆位走它，
+      `跑50条.py` 的 C03 也走它 —— 断言比的是**产品自己的数**，
+      不是测试这边另写一份公式（同「构建期断言必须照抄运行时读取函数」）。
+      另写一份的话，改了一处、另一处照样绿。
+    """
+    return int(COLLAPSED_H * dpi_scale(hwnd))
 
 
 def _find_own(title):
@@ -169,7 +226,9 @@ class Shell:
 
         if self.collapsed:
             w = PANEL_W if self.edge in ("left", "right") else mw
-            h = COLLAPSED_H
+            # ★ 走 `collapsed_h_for`，别直接用常量 —— 它是 CSS 像素，
+            #   窗口要的是物理像素（见那个常量上面的长注释）。
+            h = collapsed_h_for(self.hwnd)
         elif self.edge in ("left", "right"):
             w, h = PANEL_W, mh
         else:

@@ -49,6 +49,7 @@ ctypes.windll.shcore.SetProcessDpiAwareness(2)   # 探针必须自己 DPI 感知
 import win32api                                                   # noqa: E402
 import win32con                                                   # noqa: E402
 import win32gui                                                   # noqa: E402
+import win32process                                               # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(os.path.dirname(HERE), "app")
@@ -212,11 +213,12 @@ def main():
     try:
         try:
             run(app)
-        except BOX.ScreenLocked:
+        except BOX.Bail as e:
             # 开局 `require_clean_screen()` 已经查过一次没锁 —— 所以走到这里，
-            # 一定是【跑到一半才锁的】。措辞在 `BOX.lock_bail()` 里，四个脚本共用。
+            # 一定是【跑到一半才锁的】。措辞在 `BOX.why_bail()` 里，四个脚本共用。
+            # ⚠ 收父类不收敛的：见 `框选联调.Bail`。
             interrupted = True
-            BOX.lock_bail()
+            BOX.why_bail(e)
         finally:
             for p in (note, app):
                 subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
@@ -239,9 +241,9 @@ def main():
         if not interrupted:
             try:
                 run_clip(port)
-            except BOX.ScreenLocked:
+            except BOX.Bail as e:
                 interrupted = True
-                BOX.lock_bail()
+                BOX.why_bail(e)
 
         # ⚠ ⑧ 同样【另起一个干净实例】，理由和 ⑦ 一字不差
         #   （日志只能有一个作者 + 上一相的卡片会干扰 OCR）。
@@ -250,9 +252,9 @@ def main():
         if not interrupted:
             try:
                 run_clip_whitelist(port)
-            except BOX.ScreenLocked:
+            except BOX.Bail as e:
                 interrupted = True
-                BOX.lock_bail()
+                BOX.why_bail(e)
 
         # ⚠ ⑨ 同样【另起一个干净实例】，理由和 ⑦⑧ 一字不差。
         #   它还多一条自己的：这一相要在半路【换掉假服务器的回答】
@@ -262,9 +264,9 @@ def main():
         if not interrupted:
             try:
                 run_detail(port)
-            except BOX.ScreenLocked:
+            except BOX.Bail as e:
                 interrupted = True
-                BOX.lock_bail()
+                BOX.why_bail(e)
     finally:
         srv.shutdown()
 
@@ -465,7 +467,10 @@ def _run_clip_asserts(app):
     # ★ 中文术语【不在候选表里】—— 它靠的就是 extras 那条通道上屏
     #   （v0.10 决策 47 留下的、唯一不依赖候选表的卡片来源）。
     panel = BOX.find_window(BOX.PANEL_TITLE, app.pid)
-    if not BOX.check("拿到主窗口句柄（clip 那一相）", bool(panel)):
+    if not BOX.check("拿到主窗口句柄（clip 那一相）", bool(panel),
+                     f"本相 pid={app.pid}　"
+                     f"退出码={'还活着' if app.poll() is None else app.poll()}　"
+                     f"屏幕上的「问了吗」窗 {len(_panels_now())} 扇"):
         _dump_clip(app)
         return
     # ★ 量几何之前先等 app 自己说「摆好了」（L.11 ③.2）。
@@ -611,8 +616,18 @@ def _run_whitelist_asserts(app):
               hint="调了就是拿用户的钱去解释了不该显示的词")
 
     # ── 判据②：屏幕上的话必须说清【这条路走不通】 ─────────────
+    # ★ detail 必须说清楚「等了多久、当时屏幕上有几扇窗」——
+    #   2026-09-24 这条红过一次（同样的代码单独跑是绿的），而它当时的 detail
+    #   是**空的**：红是红了，看着像「窗口没了」，跟真因毫无关系，
+    #   只能重跑一遍碰运气。判据错了可以改判据；判据的**输出**不说是怎么回事，
+    #   就只剩重跑这一条路。
+    _t2 = time.time()
     panel = BOX.find_window(BOX.PANEL_TITLE, app.pid)
-    if not BOX.check("拿到主窗口句柄（白名单那一相）", bool(panel)):
+    if not BOX.check("拿到主窗口句柄（白名单那一相）", bool(panel),
+                     f"等了 {time.time() - _t2:.1f}s　"
+                     f"本相 pid={app.pid}　"
+                     f"退出码={'还活着' if app.poll() is None else app.poll()}　"
+                     f"屏幕上的「问了吗」窗 {len(_panels_now())} 扇"):
         _dump_clip(app)
         return
     # ★ 同 clip 那一相（L.11 ③.2）：先等「窗口已就位」再量几何。
@@ -648,17 +663,61 @@ def _run_whitelist_asserts(app):
     WL_DONE[0] = True       # ← 跑到这里这一相才算【整相跑完】。见 main()。
 
 
+def _panels_now():
+    """此刻屏幕上有几扇「问了吗」的窗、各属于哪个 pid。
+
+    ★ 加它的理由（2026-09-24）：`AI端到端联调` 在**单独跑**时 51/51 全绿，
+      在**全量回归里**红过一次，红的正是「拿到主窗口句柄（白名单那一相）」——
+      上一条断言刚说完「模型一次都没被调」，下一条就找不到窗口了。
+      只打日志尾部**说不清那 25 秒里发生了什么**，于是只能重跑一遍靠运气。
+
+      两种可能的现场，这条能一眼分开：
+        · 列表里有**不属于 `app.pid`** 的那扇窗 → 上一相（⑦）的实例没死干净，
+          两相共用一份日志/一扇窗（L.10 那个「日志只有一个作者」的老坑）；
+        · 列表是空的、且 `app.poll()` 有退出码 → 那个进程**自己退了**，
+          这就不再是测试的问题，是产品会当着用户的面消失。
+    """
+    out = []
+
+    def cb(h, _):
+        if "问了吗" in win32gui.GetWindowText(h):
+            out.append((h, win32process.GetWindowThreadProcessId(h)[1],
+                        bool(win32gui.IsWindowVisible(h))))
+        return True
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception as e:
+        return [("（枚举失败）", repr(e), False)]
+    return out
+
+
 def _dump_clip(app):
-    """clip 那一相没跑通时，把 app 日志尾部打出来。
+    """clip 那一相没跑通时，把现场打出来。
 
     ⚠ 诊断代码必须比被测代码更不容易出错（auto.py / hotkey.py 同款告诫）：
       这里只读文件、只 print，不碰窗口也不碰剪贴板。
     """
-    print("    ── app 日志尾部（诊断用）──")
+    # ★ 先说清楚【那个进程还在不在】—— 这一条决定了后面怎么读日志。
+    #   进程在 → 日志是「跑到哪一步」；进程没了 → 日志是「死之前说到哪」。
+    code = app.poll()
+    print(f"    ── 进程状态：{'还活着' if code is None else f'已经退出（退出码 {code}）'}"
+          f"，pid={app.pid} ──")
+    pans = _panels_now()
+    print(f"    ── 此刻屏幕上的「问了吗」窗口：{len(pans)} 扇 ──")
+    for h, pid, vis in pans:
+        who = "本相这个" if pid == app.pid else "★ 不是本相的（上一相没死干净？）"
+        print(f"      hwnd={h}　pid={pid}　可见={vis}　{who}")
+    # ⚠ 打【整份】不打尾部：这份日志本来就只有十几行，
+    #   截尾只会在最需要上下文的时候把开头（启动那几行）切掉。
+    print("    ── app 日志全文（诊断用）──")
     try:
         with open(APPLOG, encoding="utf-8", errors="replace") as f:
-            for ln in f.readlines()[-25:]:
-                print("      " + ln.rstrip())
+            lines = f.readlines()
+        for ln in lines:
+            print("      " + ln.rstrip())
+        if not lines:
+            print("      （日志是空的 —— 那个进程连一个字都没来得及写）")
     except Exception as e:
         print(f"      （读日志失败：{e!r}）")
 

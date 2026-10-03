@@ -243,6 +243,12 @@ def _pairs(res):
 #   这边会【静静地】按老规矩判，不报错。
 ScreenLocked = BOX.ScreenLocked
 
+# ⚠ 收尾一律收**父类** `Bail`（`ScreenLocked` 和 `CursorStuck` 都挂在它底下）。
+#   写死成 `ScreenLocked` 的话，2026-09-24 那种「光标摆不动」会从这条
+#   `except` 底下漏过去，变成 raw traceback 崩掉整份脚本 ——
+#   **而漏掉的样子是「大部分时候会好好收尾，偶尔崩」**，最难查的那种。
+Bail = BOX.Bail
+
 
 def grab_scaled(rect, path, scale=1):
     """截一块屏幕存成 PNG，可以先放大。
@@ -792,11 +798,11 @@ def main():
         #   而按标题找窗口必须带上 pid（决策 31），否则会抓到上一轮
         #   没杀干净的旧笔记窗口，顶上去的还是被压住的那个。
         run(app, note)
-    except ScreenLocked:
+    except Bail as e:
         # 开局 `require_clean_screen()` 已经查过一次没锁，所以走到这里
-        # 一定是【跑到一半才锁的】。措辞在 `BOX.lock_bail()` 里，四个脚本共用。
+        # 一定是【跑到一半才锁的】。措辞在 `BOX.why_bail()` 里，四个脚本共用。
         interrupted = True
-        BOX.lock_bail()
+        BOX.why_bail(e)
     finally:
         for p in (note, app):
             subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
@@ -1320,8 +1326,52 @@ def run(app, note):
     BOX.check("排除掉的词【没有】被导出时漏掉（排除只影响显示，不删库）",
               any(first_cell(ln) == EXCLUDE_TERM for ln in rows),
               f"{EXCLUDE_TERM} 不在导出里")
-    BOX.check("文件写了「这是快照」的说明（下一版别拿改过的文件来问为什么没生效）",
-              "不会回到" in text)
+    # ⚠ 这一条和 `知识库联调.py` 的 t_export 盯的是**同一行字**，
+    #   所以 v0.31 改文件头时**两处都得改**（同一个字段有几个调用点
+    #   就是几个守卫目标）。只改函数级那份的话，这里会顶着
+    #   「导出功能坏了」的名字红 —— 而坏的是那句话本身。
+    #   v0.31 之前这里判的是 `"不会回到" in text`（导出 = 只读快照），
+    #   导入落地那天它就是假话了。
+    # ⚠ 判据只取**注释行**：解释正文里出现「导入」「备份」两个字是可能的，
+    #   拿整个文件去 `in` 的话这条会白过。
+    head = "".join(ln for ln in text.splitlines() if ln.startswith("<!--"))
+    BOX.check("文件头写明了「改了能用导入读回库」（v0.31 起，不再是只读快照）",
+              "导入" in head and "读回" in head and "不会回到" not in head,
+              head[:120] or "(一条注释行都没有)")
+    BOX.check("文件头还写明了冲突口径（这份文件赢 + 旧值先备份）",
+              "为准" in head and "备份" in head, head[:120])
+
+    # ══════════ 导入自定义知识库（v0.31） ══════════
+    step("⑫ v0.31 的「导入」入口（还在操作台里，和 ⑪ 同一屏）")
+    #
+    # ⚠⚠ **这一节【不点】「导入」。** 它弹的是一个**模态**文件框
+    #    （`filedialog.askopenfilename`），要人拿鼠标点；没人点就一直挂到
+    #    `_tk_run` 的 180 秒超时 —— 那会把整份回归拖住三分钟，然后以
+    #    「导入功能坏了」的名字红。所以：
+    #    **「点按钮 → 弹选框 → 选到文件 → 真的导进去」那一跳，
+    #    没有被任何自动化覆盖。** 导出目录那个选择框同理（本脚本从头到尾
+    #    是直接往 settings 里写 `kb_dir`，从没点过「选择」）。
+    #    `知识库联调.py` 的 t_picker 钉住的只是**子进程那一半**
+    #    （跑起来 → stdout → 路径），不是「按钮 → 选框」这一跳。
+    #    ★ 写这么长一段，是为了让下一个红着脸来翻代码的人**先看到它没被验过**，
+    #      而不是把这一节读成「导入验过了」。
+    #
+    # ⚠ 判据要用**几何**，不能只判「找得到」：
+    #   「导入」这两个字在操作台里有【第二个生产者】—— 按钮下面那句说明
+    #   「导入一份两栏 md；…」里也有。`scan()` 是子串匹配、只取第一条命中的行，
+    #   按钮哪天被删了，它会命中那句话，`"导入" in hits` 照样为真 ——
+    #   那就是一条装饰品断言（本项目最忌讳的那种：全绿，但什么也没看着）。
+    #   只有「它和「导出 md」在同一行」是**只有按钮才成立**的事。
+    imp = scan(panel_rect, ["导入", "收纳历史", "导出md"], tag="import")
+    need = ["导入", "收纳历史", "导出md"]
+    if not BOX.check("操作台里找到了「导入」（连同同一排的「收纳历史」「导出 md」）",
+                     all(n in imp for n in need),
+                     f"缺：{[n for n in need if n not in imp]}"):
+        return
+    dy = abs(imp["导入"][1] - imp["导出md"][1])
+    BOX.check("★ 「导入」和「导出 md」在同一行 —— 找到的是【按钮】本身，"
+              "不是下面那句也含「导入」的说明",
+              dy < 25, f"两者 y 差 {dy}px　{imp['导入']} / {imp['导出md']}")
 
     print("\n       结果截图：冒烟测试\\_e2e_r11.png（第 1 轮卡片）"
           " / _e2e_export1.png（收尾那一屏）")

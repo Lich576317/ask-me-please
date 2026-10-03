@@ -640,8 +640,11 @@ def _esc_cell(s):
 def export_md(scope="all", out_dir=None):
     """导出成 md。scope: 'all' 导整库，'today' 导今天动过的（决策 11）。
 
-    ⚠ 这是【快照】。文件里改的东西不会回到库里 —— 导入功能排在下一版。
-      这个事实要写进文件头，否则下一版用户会拿着编辑过的文件来问为什么没生效。
+    ⚠ **v0.31 起这不是「只读快照」了**：导出的文件可以被 `import_md()` 读回库。
+      文件头必须把这件事写明 —— 反过来（还写着「改了不会回库」）的话，
+      用户改完根本不会想到可以导回来，那份文件就永远只是一张死照片。
+      ★ 这句以前写的是「在这里改的内容不会回到库里」，导入落地当天它就变成了假话；
+      钉着它的那条断言（知识库联调 t_export）必须同一次改掉，不许只改一半。
 
     ⚠ 严格两栏。想标「来自知识库 / AI」只能放在表格外 ——
       多一列，下一版的导入就没法按列对齐了。
@@ -665,7 +668,8 @@ def export_md(scope="all", out_dir=None):
 
     out = [
         f"<!-- {title} -->",
-        "<!-- 这是导出当时的快照。在这里改的内容不会回到「问了吗」的库里。 -->",
+        "<!-- 在这里改的内容，用操作台的「导入」能读回「问了吗」的库里。 -->",
+        "<!-- 同一个词以【这份文件】为准：导入会覆盖库里的旧解释，旧值会先另存一份备份。 -->",
         "",
         f"# {title}",
         "",
@@ -708,6 +712,240 @@ def default_dir():
     """
     d = os.path.join(os.path.expanduser("~"), "Documents", "问了吗")
     return d
+
+
+# ══════════ 导入自定义知识库（v0.31） ══════════
+#
+# 决策 14 当初就把导出定成「两栏、可编辑、将来要能再导回」—— 这一段就是那个
+# 「再导回」。所以解析器【必须】和导出的写法一一对应：
+#   · 严格两栏          —— 多一列就对不齐（见 export_md 的 docstring）
+#   · 反斜杠先于竖线转义 —— 顺序反了会把列撑破（见 _esc_cell 的 docstring）
+#
+# ⚠ 解析器【唯一实现处】在这里。冒烟测试从这一份 import 过去，不许在测试文件里
+#   再抄一份 —— 本项目栽过一次「构建期断言和运行时的读取函数各写各的」
+#   （aipm-job-assistant 的 `.schema` vs 顶层 `properties`，构建期全绿、运行时全错）。
+#
+# ⚠ 冲突口径（**用户 2026-09-23 拍板**）：**导入的赢**。
+#   理由：决策 14 说的主用法就是「导出 → 在 Obsidian 里改 → 导回」，
+#   库里赢的话，用户改完导回来会发现「改的没生效」，而且【不报错】。
+
+def split_md_row(ln):
+    """把一行 md 表格拆成格子，处理转义。
+
+    ⚠ 首尾各有一个 `|`，直接切会多出两个【空】格子 ——
+      第一版就是栽在这儿的，四条断言一起红，看起来像导出坏了，
+      其实导出是对的、解析器是错的。
+    """
+    cells, cur, i = [], "", 0
+    body = ln.rstrip("\n")
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\" and i + 1 < len(body):
+            cur += body[i + 1]; i += 2; continue
+        if ch == "|":
+            cells.append(cur); cur = ""; i += 1; continue
+        cur += ch; i += 1
+    cells.append(cur)
+    return [c.strip() for c in cells[1:-1]]      # 掐掉首尾竖线带来的空格子
+
+
+def _read_text(path):
+    """读文件 → (文本, 实际用的编码)。
+
+    ⚠ 用户在 Obsidian / 记事本里改完再存，**多半不是 UTF-8** ——
+      本机 locale 是中文，记事本默认存 ANSI(GBK)。只认 UTF-8 的话，
+      那份文件会被判成「一行表格都没有」,而真正的原因是编码不对 ——
+      **报错文本自己先撒了谎**,用户会去检查表格写得对不对,方向全错。
+
+    ⚠ 认不出来就【如实报错】,不要 `errors="replace"` 硬解 ——
+      那会读出一堆 `�`,然后当成「表格格式不对」报上去,
+      比直接失败更难查。
+    """
+    raw = open(path, "rb").read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):        # UTF-16 的 BOM，记事本「Unicode」档
+        return raw.decode("utf-16"), "utf-16"
+    for enc in ("utf-8-sig", "gbk"):                 # utf-8-sig 顺带吃掉 BOM
+        try:
+            return raw.decode(enc), ("utf-8" if enc == "utf-8-sig" else enc)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("这份文件既不是 UTF-8、也不是 GBK/UTF-16，读不出文字")
+
+
+def parse_md(path):
+    """读一份两栏 md → (rows, report)。
+
+    rows   = [(术语, 解释), ...]
+    report = {"encoding", "rows", "bad": [(行号, 原文, 为什么不要它), ...]}
+
+    ★ 返回值是【两样】，不是一样 —— 故意的。
+      只回 rows 的话，调用方可以顺手把「跳过了 12 行」无视掉，
+      而那种无视【不会报错】：用户看到的是「我文件里明明 50 条，
+      怎么只进来 38 条」，然后开始怀疑是我们把数据弄丢了。
+      要拿 rows，就得先把 report 接住。
+    """
+    text, enc = _read_text(path)
+    rows, bad = [], []
+    for i, ln in enumerate(text.splitlines(), 1):
+        s = ln.strip()
+        if not s.startswith("|"):
+            continue                                 # 空行 / 注释 / 正文，本来就不是表格行
+        if s.startswith("| -") or s.startswith("|-"):
+            continue                                 # `| --- | --- |` 分隔行
+        cells = split_md_row(s)
+        if len(cells) != 2:
+            bad.append((i, ln, f"有 {len(cells)} 列，不是 2 列"))
+            continue
+        if cells[0] == "术语" and cells[1] == "解释":
+            continue                                 # 表头
+        if not cells[0] or not cells[1]:
+            bad.append((i, ln, "术语或解释是空的"))
+            continue
+        rows.append((cells[0], cells[1]))
+    return rows, {"encoding": enc, "rows": len(rows), "bad": bad}
+
+
+def _write_backup(over, out_dir=None):
+    """把【即将被覆盖】的旧解释写成一份两栏 md → 文件路径。
+
+    ★ 为什么是文件，不是往 history 里塞一条（这一点在动手时想反过一次）：
+
+      · `history` 的 docstring 白纸黑字写着「只服务于『收纳历史』这一件事，
+        **不是审计日志**。后来的人别顺手加字段」—— 往里塞导入备份，
+        等于当场违反那段话。
+      · 更要命的是它是坏的：`harvest()` 取的是【每个 key 最新的那条】，
+        旧解释一旦以「最新」的身份进去，那个词在 repeat 模式下重新答出来的
+        新版就**永远收编不了**了（harvest 见到 `source='import'` 会跳过）。
+        等于留了个没人能取的东西，还顺手弄坏另一个功能。
+      · 写成文件则：用户看得见、打得开、能【原样再导回来】——
+        「捞回来」这件事不需要再为它做一个界面。
+
+    ⚠ 文件用的是和 export_md 完全一样的格式，所以它自己就是一份可导入的 md。
+    """
+    if out_dir is None:
+        out_dir = default_dir()
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:
+        return None, f"建不了目录：{out_dir}（{e}）"
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = [
+        "<!-- 问了吗 · 导入前备份 -->",
+        f"<!-- 下面 {len(over)} 条解释在导入时被文件里的新版本覆盖，旧值原样留在这里。 -->",
+        "<!-- 想反悔：把这份文件直接【导入】回去就行（格式和导出的完全一样）。 -->",
+        "",
+        f"# 问了吗 · 导入前备份（{_today()} {stamp}）",
+        "",
+        "| 术语 | 解释 |",
+        "| --- | --- |",
+    ]
+    for term, expl in over:
+        out.append(f"| {_esc_cell(term)} | {_esc_cell(expl)} |")
+
+    path = os.path.join(out_dir, f"问了吗-导入前备份-{stamp}.md")
+    try:
+        # 和 export_md 同一条纪律：显式 encoding + newline，UTF-8 无 BOM。
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(out) + "\n")
+    except Exception as e:
+        return None, f"备份写不出来：{e}"
+    return path, ""
+
+
+def import_md(path, out_dir=None):
+    """导入一份两栏 md。**导入的赢**（用户 2026-09-23 拍板）。
+
+    三件事按顺序做，顺序不能换：
+      ① 先【只看不写】地把整个文件过一遍，算出要新增/覆盖/跳过各多少；
+      ② 要覆盖的话，先把那些旧值写成一份能再导回来的备份文件；
+      ③ 备份落盘成功了，才真正动库。
+
+    ⚠ ② 失败就【整件事不做】。用户选的是「导入的赢 + 旧值留底」，
+      留底写不出来还照导，等于背着他把原来那些解释抹了 ——
+      那不是这份功能的一半，那是另一个功能。
+
+    返回 {ok, total, added, updated, unchanged, skipped, dupes, bad, backup, ...}
+    失败时 {ok: False, msg: 人话, ...}
+    """
+    try:
+        rows, rep = parse_md(path)
+    except Exception as e:
+        return {"ok": False, "msg": "这份文件读不出来", "detail": str(e)}
+
+    if not rows:
+        return {"ok": False, "msg": "这份文件里一行两栏表格都没读到",
+                "encoding": rep["encoding"], "bad": len(rep["bad"]),
+                "bad_rows": rep["bad"][:20]}
+
+    now = _now()
+    c = _connect()
+    added = updated = unchanged = skipped = dupes = 0
+    with _lock:
+        with c:
+            ex = {r["key"] for r in c.execute("SELECT key FROM excluded").fetchall()}
+            have = {r["key"]: r for r in
+                    c.execute("SELECT key, term, explanation FROM terms").fetchall()}
+
+            # 文件自己内部重复的词：后一条赢，但要【数出来】告诉用户。
+            got = {}
+            for term, expl in rows:
+                k = canon(term)
+                if not k:
+                    skipped += 1
+                    continue
+                if k in got:
+                    dupes += 1
+                got[k] = (term, expl)
+
+            plan = []
+            for k, (term, expl) in got.items():
+                if is_excluded(k, ex):
+                    skipped += 1                     # 排除名单里的词，导进来也永远不会显示
+                    continue
+                old = have.get(k)
+                if old is None:
+                    plan.append(("add", k, term, expl, None))
+                elif old["explanation"] == expl:
+                    # 一字不差 —— 不算覆盖。否则同一份文件导第二次会报一堆
+                    # 「覆盖 N 条」，用户以为出了事，其实什么都没变。
+                    plan.append(("same", k, term, expl, None))
+                else:
+                    plan.append(("upd", k, term, expl, old["explanation"]))
+
+        over = [(p[2], p[4]) for p in plan if p[0] == "upd"]
+        backup = None
+        if over:
+            backup, why = _write_backup(over, out_dir)
+            if not backup:
+                return {"ok": False,
+                        "msg": f"有 {len(over)} 条会被覆盖，但备份没写成，这次导入没做",
+                        "detail": why}
+
+        with c:
+            for kind, k, term, expl, _old in plan:
+                if kind == "add":
+                    c.execute(
+                        "INSERT INTO terms"
+                        "(key, term, explanation, source, created_at, updated_at, last_used_at)"
+                        " VALUES(?,?,?,?,?,?,NULL)",
+                        (k, term, expl, "import", now, now))
+                    added += 1
+                elif kind == "same":
+                    unchanged += 1
+                else:
+                    # term 也跟着文件走 —— 「导入的赢」是这个功能的全部意思
+                    c.execute(
+                        "UPDATE terms SET term=?, explanation=?, source='import',"
+                        " updated_at=? WHERE key=?",
+                        (term, expl, now, k))
+                    updated += 1
+
+    return {"ok": True, "path": path, "encoding": rep["encoding"],
+            "total": rep["rows"], "added": added, "updated": updated,
+            "unchanged": unchanged, "skipped": skipped,
+            "dupes": dupes, "bad": len(rep["bad"]), "bad_rows": rep["bad"][:20],
+            "backup": backup}
 
 
 # ══════════ 给界面用的统计 ══════════
