@@ -63,7 +63,7 @@
 **环境**：Windows 11 + Python 3.14。界面跑在系统自带的 WebView2 上（不打包 Chromium），窗口摆放、剪贴板、DPAPI 都直接走 Win32 —— **目前只有 Windows 版本**。
 
 ```bash
-git clone https://github.com/<你的用户名>/ask-me-please.git
+git clone https://github.com/Lich576317/ask-me-please.git
 cd ask-me-please
 pip install -r requirements.txt
 python app/main.py
